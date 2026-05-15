@@ -5,3 +5,4 @@
 //! binary in `src/bin/` is a thin entry point; the real work lives here.
 
 pub mod pod;
+pub mod runtime;

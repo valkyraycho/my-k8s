@@ -26,7 +26,7 @@ struct Args {
 }
 
 impl Args {
-    fn validate_and_parse(&self) -> Result<()> {
+    fn validate_and_prepare(&self) -> Result<()> {
         ensure_dir(&self.manifests_dir).context("preparing manifests dir")?;
         ensure_dir(&self.state_dir).context("preparing state dir")?;
         if !self.rootfs_base.is_dir() {
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    args.validate_and_parse()?;
+    args.validate_and_prepare()?;
     info!(?args, "kubelet starting");
 
     Ok(())
