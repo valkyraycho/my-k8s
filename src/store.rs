@@ -8,8 +8,7 @@ use crate::{
 /// Everything the kubelet knows about one Pod: the desired manifest plus
 /// the live sandbox holding its containers.
 pub struct PodState {
-    /// Desired state, as parsed from the manifest YAML. The reconciler
-    /// diffs this against actual container state to compute next actions.
+    /// The manifest this sandbox was created from.
     pub pod: Pod,
     /// Live sandbox (pause container + app container handles).
     pub sandbox: PodSandbox,
