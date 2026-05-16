@@ -724,6 +724,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libcontainer",
+ "nix 0.29.0",
  "oci-spec",
  "serde",
  "serde_yaml_ng",

@@ -9,6 +9,7 @@
 //! Interface, a gRPC API). Our trait is a tiny in-process equivalent.
 
 pub mod bundle;
+pub mod youki;
 
 use std::path::Path;
 
