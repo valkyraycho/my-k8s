@@ -8,6 +8,8 @@
 //! In real Kubernetes, this role is played by CRI (the Container Runtime
 //! Interface, a gRPC API). Our trait is a tiny in-process equivalent.
 
+pub mod bundle;
+
 use std::path::Path;
 
 use thiserror::Error;
