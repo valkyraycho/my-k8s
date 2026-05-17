@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result};
@@ -47,6 +47,7 @@ pub struct Reconciler<R: RuntimeClient> {
     store: Store,
     runtime: R,
     restart_state: HashMap<String, RestartTracker>,
+    debug_dump_path: Option<PathBuf>,
 }
 
 impl<R: RuntimeClient> Reconciler<R> {
@@ -55,6 +56,7 @@ impl<R: RuntimeClient> Reconciler<R> {
         pods_dir: PathBuf,
         rootfs_base: PathBuf,
         runtime: R,
+        debug_dump_path: Option<PathBuf>,
     ) -> Self {
         Self {
             manifests_dir,
@@ -63,6 +65,7 @@ impl<R: RuntimeClient> Reconciler<R> {
             store: Store::new(),
             runtime,
             restart_state: HashMap::new(),
+            debug_dump_path,
         }
     }
 
@@ -124,6 +127,12 @@ impl<R: RuntimeClient> Reconciler<R> {
             if let Err(e) = self.reconcile_liveness(name, pod) {
                 error!(error = ?e, "failed to reconcile pod");
             }
+        }
+
+        if self.debug_dump_path.is_some()
+            && let Err(e) = self.write_debug_snapshot()
+        {
+            warn!(error = ?e, "failed to write debug snapshot");
         }
     }
 
@@ -258,6 +267,56 @@ impl<R: RuntimeClient> Reconciler<R> {
         }
         self.restart_state.clear();
     }
+
+    fn write_debug_snapshot(&self) -> Result<()> {
+        let path = match &self.debug_dump_path {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+
+        let now = Instant::now();
+        let pods: Vec<_> = self
+            .store
+            .names()
+            .into_iter()
+            .map(|name| {
+                let state = self.store.get(&name).expect("name came from store");
+                let containers: Vec<_> = state
+                    .pod
+                    .spec
+                    .containers
+                    .iter()
+                    .map(|c| {
+                        let id = format!("{name}__{}", c.name);
+                        let tracker = self.restart_state.get(&id);
+                        serde_json::json!({
+                            "name": c.name,
+                              "command": c.command,
+                              "restart_count": tracker.map(|t| t.restart_count).unwrap_or(0),
+                              "backoff_remaining_secs": tracker.map(|t| {
+                                  t.next_retry_at.saturating_duration_since(now).as_secs()
+                              }).unwrap_or(0),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "name": name,
+                    "pause_pid": state.sandbox.pause_pid(),
+                    "containers": containers,
+                })
+            })
+            .collect();
+
+        let snapshot = serde_json::json!({
+            "ts_unix": SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            "pod_count": self.store.len(),
+            "pods": pods,
+        });
+
+        std::fs::write(path, serde_json::to_string_pretty(&snapshot)?)
+            .with_context(|| format!("writing debug snapshot to {path:?}"))?;
+        Ok(())
+    }
 }
 
 /// Exponential backoff: BASE * 2^(n-1), capped at MAX.
@@ -380,7 +439,13 @@ mod tests {
         let pods_dir = unique_temp_dir(label);
         let manifests_dir = unique_temp_dir(&format!("{label}-manifests"));
         let rootfs = std::env::temp_dir().join("nonexistent-rootfs");
-        Reconciler::new(manifests_dir, pods_dir, rootfs, MockRuntime::default())
+        Reconciler::new(
+            manifests_dir,
+            pods_dir,
+            rootfs,
+            MockRuntime::default(),
+            None,
+        )
     }
 
     fn desired_map(pods: Vec<Pod>) -> HashMap<PodName, Pod> {

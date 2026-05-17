@@ -72,6 +72,7 @@ async fn main() -> Result<()> {
         args.pods_dir(),
         args.rootfs_base.clone(),
         runtime,
+        Some(args.state_dir.join("debug.json")),
     );
 
     let cancel = CancellationToken::new();

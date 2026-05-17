@@ -728,6 +728,7 @@ dependencies = [
  "nix 0.29.0",
  "oci-spec",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
  "thiserror 2.0.18",
  "tokio",
