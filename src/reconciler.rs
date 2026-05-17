@@ -195,13 +195,12 @@ impl<R: RuntimeClient> Reconciler<R> {
 
             match s {
                 ContainerState::Stopped | ContainerState::NotFound => {
-                    let tracker =
-                        restart_state
-                            .entry(container_id.clone())
-                            .or_insert_with(|| RestartTracker {
-                                restart_count: 0,
-                                next_retry_at: Instant::now(),
-                            });
+                    let tracker = restart_state
+                        .entry(container_id.clone())
+                        .or_insert_with(|| RestartTracker {
+                            restart_count: 0,
+                            next_retry_at: Instant::now(),
+                        });
 
                     // In backoff? Skip this tick.
                     let now = Instant::now();
@@ -271,4 +270,363 @@ fn compute_backoff(restart_count: u32) -> Duration {
     let base_micros = BACKOFF_BASE.as_micros() as u64;
     let micros = base_micros.saturating_mul(multiplier);
     Duration::from_micros(micros).min(BACKOFF_MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    use crate::pod::{Container, PodMetadata, PodSpec};
+    use crate::runtime::{Result as RuntimeResult, RuntimeError};
+
+    /// Mock runtime. Records every call. Killed containers automatically
+    /// report Stopped on subsequent state queries (simulates termination)
+    /// so tests don't have to manually set up state sequences for the
+    /// sandbox's grace-period polling.
+    #[derive(Default)]
+    struct MockRuntime {
+        calls: Vec<String>,
+        /// Explicit FIFO state overrides per container_id. Consumed before
+        /// the killed/default logic kicks in.
+        state_seq: HashMap<String, Vec<ContainerState>>,
+        pids: HashMap<String, u32>,
+        /// IDs whose create_container should return Err (for rollback tests).
+        create_should_fail: HashSet<String>,
+        /// Containers that have been killed but not yet recreated. They
+        /// report Stopped on state queries until delete+create cycles them.
+        killed: HashSet<String>,
+    }
+
+    impl RuntimeClient for MockRuntime {
+        fn create_container(&mut self, id: &str, _bundle_path: &Path) -> RuntimeResult<()> {
+            self.calls.push(format!("create({id})"));
+            if self.create_should_fail.contains(id) {
+                return Err(RuntimeError::Other(anyhow::anyhow!(
+                    "injected create failure"
+                )));
+            }
+            self.killed.remove(id); // fresh container — no longer "killed"
+            Ok(())
+        }
+
+        fn start_container(&mut self, id: &str) -> RuntimeResult<()> {
+            self.calls.push(format!("start({id})"));
+            Ok(())
+        }
+
+        fn kill_container(&mut self, id: &str, signal: i32) -> RuntimeResult<()> {
+            self.calls.push(format!("kill({id},{signal})"));
+            self.killed.insert(id.to_string());
+            Ok(())
+        }
+
+        fn delete_container(&mut self, id: &str, force: bool) -> RuntimeResult<()> {
+            self.calls.push(format!("delete({id},force={force})"));
+            self.killed.remove(id); // gone
+            Ok(())
+        }
+
+        fn container_state(&mut self, id: &str) -> RuntimeResult<ContainerState> {
+            self.calls.push(format!("state({id})"));
+            let seq = self.state_seq.entry(id.to_string()).or_default();
+            if !seq.is_empty() {
+                return Ok(seq.remove(0));
+            }
+            if self.killed.contains(id) {
+                return Ok(ContainerState::Stopped);
+            }
+            Ok(ContainerState::Running)
+        }
+
+        fn container_pid(&mut self, id: &str) -> RuntimeResult<Option<u32>> {
+            self.calls.push(format!("pid({id})"));
+            Ok(self.pids.get(id).copied())
+        }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("my-k8s-test-reconciler-{label}-{pid}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_pod(name: &str, containers: Vec<(&str, Vec<&str>)>) -> Pod {
+        Pod {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            metadata: PodMetadata { name: name.into() },
+            spec: PodSpec {
+                containers: containers
+                    .into_iter()
+                    .map(|(cname, cmd)| Container {
+                        name: cname.into(),
+                        image: "busybox".into(),
+                        command: cmd.into_iter().map(String::from).collect(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn make_reconciler(label: &str) -> Reconciler<MockRuntime> {
+        let pods_dir = unique_temp_dir(label);
+        let manifests_dir = unique_temp_dir(&format!("{label}-manifests"));
+        let rootfs = std::env::temp_dir().join("nonexistent-rootfs");
+        Reconciler::new(manifests_dir, pods_dir, rootfs, MockRuntime::default())
+    }
+
+    fn desired_map(pods: Vec<Pod>) -> HashMap<PodName, Pod> {
+        pods.into_iter()
+            .map(|p| (p.metadata.name.clone(), p))
+            .collect()
+    }
+
+    /// Count how many times a specific call string appears in the recorded log.
+    fn count_calls(r: &Reconciler<MockRuntime>, needle: &str) -> usize {
+        r.runtime.calls.iter().filter(|c| *c == needle).count()
+    }
+
+    #[test]
+    fn empty_desired_with_empty_store_is_noop() {
+        let mut r = make_reconciler("empty");
+        r.apply_diff(&desired_map(vec![]));
+        assert!(r.runtime.calls.is_empty());
+        assert!(r.store.is_empty());
+    }
+
+    #[test]
+    fn new_pod_creates_sandbox_then_containers() {
+        let mut r = make_reconciler("new-pod");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd", "-f"])]);
+
+        r.apply_diff(&desired_map(vec![pod]));
+
+        assert!(r.store.contains("web"));
+        // Verify lifecycle order: pause must be created+started+pid'd before app.
+        let calls = &r.runtime.calls;
+        let create_pause = calls
+            .iter()
+            .position(|c| c == "create(web__pause)")
+            .unwrap();
+        let start_pause = calls.iter().position(|c| c == "start(web__pause)").unwrap();
+        let pid_pause = calls.iter().position(|c| c == "pid(web__pause)").unwrap();
+        let create_app = calls
+            .iter()
+            .position(|c| c == "create(web__server)")
+            .unwrap();
+        let start_app = calls
+            .iter()
+            .position(|c| c == "start(web__server)")
+            .unwrap();
+        assert!(create_pause < start_pause);
+        assert!(start_pause < pid_pause);
+        assert!(pid_pause < create_app);
+        assert!(create_app < start_app);
+    }
+
+    #[test]
+    fn removed_pod_destroys_sandbox() {
+        let mut r = make_reconciler("remove");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd"])]);
+        r.apply_diff(&desired_map(vec![pod]));
+        assert!(r.store.contains("web"));
+
+        // Tick 2: pod no longer in desired.
+        r.apply_diff(&desired_map(vec![]));
+        assert!(!r.store.contains("web"), "pod should be removed");
+        // Pause must have been deleted as part of sandbox.destroy.
+        assert!(
+            r.runtime
+                .calls
+                .contains(&"delete(web__pause,force=true)".to_string()),
+            "expected pause delete; got calls: {:?}",
+            r.runtime.calls,
+        );
+    }
+
+    #[test]
+    fn stopped_container_triggers_restart() {
+        let mut r = make_reconciler("restart");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd"])]);
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+
+        r.runtime.calls.clear();
+        // First call after clear: container is observed Stopped.
+        r.runtime
+            .state_seq
+            .insert("web__server".into(), vec![ContainerState::Stopped]);
+
+        r.apply_diff(&desired_map(vec![pod]));
+
+        // Liveness saw Stopped → restart path: delete + create + start.
+        assert_eq!(count_calls(&r, "delete(web__server,force=true)"), 1);
+        assert_eq!(count_calls(&r, "create(web__server)"), 1);
+        assert_eq!(count_calls(&r, "start(web__server)"), 1);
+        // Tracker should now exist.
+        assert!(r.restart_state.contains_key("web__server"));
+    }
+
+    #[test]
+    fn backoff_skips_restart_within_window_then_fires_after_expiry() {
+        let mut r = make_reconciler("backoff");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd"])]);
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+
+        // Stays stopped across many ticks.
+        r.runtime.state_seq.insert(
+            "web__server".into(),
+            std::iter::repeat_n(ContainerState::Stopped, 20).collect(),
+        );
+
+        // Tick A: first observation → restart (count=1, next backoff = 50ms in test mode).
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+        let restarts_after_a = count_calls(&r, "create(web__server)");
+
+        // Tick B: immediately again — still in backoff, NO additional restart.
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+        let restarts_after_b = count_calls(&r, "create(web__server)");
+        assert_eq!(
+            restarts_after_a, restarts_after_b,
+            "tick within backoff window must NOT trigger an additional restart",
+        );
+
+        // Sleep past the backoff window (BACKOFF_BASE in test = 50ms).
+        std::thread::sleep(Duration::from_millis(80));
+
+        // Tick C: backoff expired → restart fires again.
+        r.apply_diff(&desired_map(vec![pod]));
+        let restarts_after_c = count_calls(&r, "create(web__server)");
+        assert_eq!(
+            restarts_after_c,
+            restarts_after_b + 1,
+            "after backoff expires, restart should fire exactly once more",
+        );
+    }
+
+    #[test]
+    fn running_container_clears_backoff_tracker() {
+        let mut r = make_reconciler("clear");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd"])]);
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+
+        // Trigger a restart so a tracker exists.
+        r.runtime
+            .state_seq
+            .insert("web__server".into(), vec![ContainerState::Stopped]);
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+        assert!(r.restart_state.contains_key("web__server"));
+
+        // Now container is back to Running.
+        r.runtime
+            .state_seq
+            .insert("web__server".into(), vec![ContainerState::Running]);
+        r.apply_diff(&desired_map(vec![pod]));
+        assert!(
+            !r.restart_state.contains_key("web__server"),
+            "tracker should be cleared after observing Running",
+        );
+    }
+
+    #[test]
+    fn partial_create_failure_rolls_back_sandbox() {
+        let mut r = make_reconciler("rollback");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        // Second app container's create fails — first one will have already started.
+        r.runtime.create_should_fail.insert("web__second".into());
+        let pod = make_pod(
+            "web",
+            vec![("first", vec!["ok"]), ("second", vec!["fails"])],
+        );
+
+        r.apply_diff(&desired_map(vec![pod]));
+
+        assert!(
+            !r.store.contains("web"),
+            "pod must NOT be in store after partial-failure rollback",
+        );
+        // Rollback destroys the sandbox: pause container deleted.
+        assert!(
+            r.runtime
+                .calls
+                .contains(&"delete(web__pause,force=true)".to_string()),
+            "rollback should delete pause; got calls: {:?}",
+            r.runtime.calls,
+        );
+        // And the partially-added "first" container also got cleaned up.
+        assert!(
+            r.runtime
+                .calls
+                .contains(&"delete(web__first,force=true)".to_string()),
+            "rollback should delete the successfully-added container too",
+        );
+    }
+
+    #[test]
+    fn remove_pod_clears_restart_trackers() {
+        let mut r = make_reconciler("clear-trackers");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd"])]);
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+
+        // Trigger a restart so a tracker exists.
+        r.runtime
+            .state_seq
+            .insert("web__server".into(), vec![ContainerState::Stopped]);
+        r.apply_diff(&desired_map(vec![pod]));
+        assert!(r.restart_state.contains_key("web__server"));
+
+        // Now remove the pod from desired.
+        r.apply_diff(&desired_map(vec![]));
+        assert!(
+            !r.restart_state.contains_key("web__server"),
+            "tracker must be removed when its pod is removed",
+        );
+    }
+
+    #[test]
+    fn shutdown_destroys_all_pods_and_clears_trackers() {
+        let mut r = make_reconciler("shutdown");
+        r.runtime.pids.insert("a__pause".into(), 1);
+        r.runtime.pids.insert("b__pause".into(), 2);
+        let a = make_pod("a", vec![("server", vec!["httpd"])]);
+        let b = make_pod("b", vec![("server", vec!["httpd"])]);
+        r.apply_diff(&desired_map(vec![a, b]));
+        assert_eq!(r.store.len(), 2);
+        // Synthesize a tracker so we can verify it's cleared too.
+        r.restart_state.insert(
+            "a__server".into(),
+            RestartTracker {
+                restart_count: 1,
+                next_retry_at: Instant::now(),
+            },
+        );
+
+        r.shutdown();
+
+        assert!(r.store.is_empty());
+        assert!(r.restart_state.is_empty());
+        assert!(
+            r.runtime
+                .calls
+                .contains(&"delete(a__pause,force=true)".to_string())
+        );
+        assert!(
+            r.runtime
+                .calls
+                .contains(&"delete(b__pause,force=true)".to_string())
+        );
+    }
 }
