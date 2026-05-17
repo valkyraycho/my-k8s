@@ -421,7 +421,10 @@ mod tests {
         Pod {
             api_version: "v1".into(),
             kind: "Pod".into(),
-            metadata: PodMetadata { name: name.into() },
+            metadata: PodMetadata {
+                name: name.into(),
+                ..Default::default()
+            },
             spec: PodSpec {
                 containers: containers
                     .into_iter()
@@ -432,6 +435,7 @@ mod tests {
                     })
                     .collect(),
             },
+            status: None,
         }
     }
 

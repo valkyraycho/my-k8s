@@ -75,8 +75,12 @@ mod tests {
         let pod = Pod {
             api_version: "v1".into(),
             kind: "Pod".into(),
-            metadata: PodMetadata { name: name.into() },
+            metadata: PodMetadata {
+                name: name.into(),
+                ..Default::default()
+            },
             spec: PodSpec { containers: vec![] },
+            status: None,
         };
         let sandbox = PodSandbox::new(
             name.into(),
