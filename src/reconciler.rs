@@ -291,11 +291,11 @@ impl<R: RuntimeClient> Reconciler<R> {
                         let tracker = self.restart_state.get(&id);
                         serde_json::json!({
                             "name": c.name,
-                              "command": c.command,
-                              "restart_count": tracker.map(|t| t.restart_count).unwrap_or(0),
-                              "backoff_remaining_secs": tracker.map(|t| {
-                                  t.next_retry_at.saturating_duration_since(now).as_secs()
-                              }).unwrap_or(0),
+                            "command": c.command,
+                            "restart_count": tracker.map(|t| t.restart_count).unwrap_or(0),
+                            "backoff_remaining_secs": tracker.map(|t| {
+                                t.next_retry_at.saturating_duration_since(now).as_secs()
+                            }).unwrap_or(0),
                         })
                     })
                     .collect();
