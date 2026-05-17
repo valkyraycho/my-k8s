@@ -71,6 +71,10 @@ impl PodSandbox {
             .context("get pause container pid")?
             .ok_or_else(|| anyhow::anyhow!("pause container pid not found"))?;
         self.pause_pid = Some(pid);
+
+        #[cfg(not(test))]
+        setup_pod_network(pid).context("configure pod network")?;
+
         Ok(())
     }
 
@@ -123,8 +127,9 @@ impl PodSandbox {
                     std::thread::sleep(POLLING_INTERVAL);
                 }
             }
-            Err(RuntimeError::NotFound(_)) => {}
-            Err(e) => return Err(e).context("send SIGTERM to container"),
+            Err(e) => {
+                warn!(error = ?e, %container_id, "SIGTERM failed during remove; proceeding to delete");
+            }
         }
 
         match runtime.delete_container(&container_id, true) {
@@ -173,6 +178,36 @@ fn pause_container_spec() -> Container {
         image: "busybox".into(),
         command: vec!["/bin/busybox".into(), "sleep".into(), "infinity".into()],
     }
+}
+
+/// Bring up the loopback interface inside a pod's network namespace.
+/// Runs from the host (which has CAP_NET_ADMIN) via nsenter — avoids
+/// granting CAP_NET_ADMIN to the pause container itself.
+///
+/// Phase 1 stand-in for the CNI `loopback` plugin.
+#[cfg(not(test))]
+fn setup_pod_network(pause_pid: u32) -> anyhow::Result<()> {
+    let output = std::process::Command::new("nsenter")
+        .args([
+            "-t",
+            &pause_pid.to_string(),
+            "-n",
+            "ip",
+            "link",
+            "set",
+            "lo",
+            "up",
+        ])
+        .output()
+        .context("invoking `nsenter ... ip link set lo up`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "loopback setup failed: status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -359,7 +394,9 @@ mod tests {
             .state_seq
             .insert("test-pod__web".into(), vec![ContainerState::Stopped]);
 
-        sandbox.destroy(&mut runtime).expect("destroy should succeed");
+        sandbox
+            .destroy(&mut runtime)
+            .expect("destroy should succeed");
 
         let web_delete_idx = runtime
             .calls

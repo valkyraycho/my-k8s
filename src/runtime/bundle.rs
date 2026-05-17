@@ -57,6 +57,17 @@ pub fn build_spec(
                     .collect::<Vec<_>>(),
             )
             .build()?,
+        MountBuilder::default()
+            .destination("/tmp")
+            .typ("tmpfs")
+            .source("tmpfs")
+            .options(
+                ["nosuid", "nodev", "mode=1777", "size=16m"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .build()?,
     ];
 
     let namespaces = build_namespaces(share_namespaces_from_pid)?;
