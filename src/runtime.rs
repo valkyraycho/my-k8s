@@ -90,4 +90,16 @@ pub trait RuntimeClient {
     /// **Critical for the sandbox pattern**: the pause container's PID is what
     /// app containers use as `/proc/{PID}/ns/net` to join its network namespace.
     fn container_pid(&mut self, id: &str) -> Result<Option<u32>>;
+
+    /// Walk the runtime's state directory and rebuild in-memory handles for
+    /// every container still present on disk. Called on kubelet startup —
+    /// closes the Phase 1 gap where a restart lost all sandbox knowledge.
+    fn recover_all(&mut self) -> Result<Vec<RecoveredContainer>>;
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveredContainer {
+    pub id: String,
+    pub state: ContainerState,
+    pub pid: Option<u32>,
 }

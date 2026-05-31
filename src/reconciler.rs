@@ -1,22 +1,30 @@
+use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
-
-use anyhow::{Context, Result};
 use tokio::task::block_in_place;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, info_span, warn};
 
 use crate::{
+    apiserver::watch::{WatchEvent, WatchEventType},
+    client::Client,
     pod::{Pod, PodName},
-    runtime::{ContainerState, RuntimeClient, sandbox::PodSandbox},
+    runtime::{ContainerState, RecoveredContainer, RuntimeClient, sandbox::PodSandbox},
     store::{PodState, Store},
-    watcher,
 };
 
-const TICK: Duration = Duration::from_secs(2);
+/// How often to poll container states and restart crashed ones.
+/// 2s matches Phase 1 — fast enough to feel responsive, cheap enough.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
+
+/// How often to relist from the apiserver as a defense against missed watch
+/// events. Real K8s informers default to 10 minutes; 30s is fine for dev.
+const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 // CrashLoopBackOff parameters. Production defaults follow real K8s
 // (10s base, 5min cap). Tests get tiny values so they run fast.
@@ -41,47 +49,72 @@ struct RestartTracker {
 }
 
 pub struct Reconciler<R: RuntimeClient> {
-    manifests_dir: PathBuf,
+    client: Arc<Client>,
     pods_dir: PathBuf,
     rootfs_base: PathBuf,
     store: Store,
     runtime: R,
     restart_state: HashMap<String, RestartTracker>,
     debug_dump_path: Option<PathBuf>,
+    cache: HashMap<PodName, Pod>,
 }
 
 impl<R: RuntimeClient> Reconciler<R> {
     pub fn new(
-        manifests_dir: PathBuf,
+        client: Arc<Client>,
         pods_dir: PathBuf,
         rootfs_base: PathBuf,
         runtime: R,
         debug_dump_path: Option<PathBuf>,
     ) -> Self {
         Self {
-            manifests_dir,
+            client,
             pods_dir,
             rootfs_base,
             store: Store::new(),
             runtime,
             restart_state: HashMap::new(),
             debug_dump_path,
+            cache: HashMap::new(),
         }
     }
 
     pub async fn run(mut self, cancel: CancellationToken) -> Result<()> {
-        let mut interval = tokio::time::interval(TICK);
-        info!("reconciler started");
+        info!("reconciler starting");
+
+        if let Err(e) = self.startup().await {
+            error!(error = ?e, "startup failed");
+            return Err(e);
+        }
+
+        let mut watch_stream = self
+            .client
+            .watch_pods(Some("0"))
+            .await
+            .context("opening watch stream")?;
+
+        let mut liveness_interval = tokio::time::interval(LIVENESS_INTERVAL);
+        let mut resync_interval = tokio::time::interval(RESYNC_INTERVAL);
+        resync_interval.tick().await;
+        liveness_interval.tick().await;
+
+        info!("reconciler entered steady state");
 
         loop {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    if let Err(e) = self.reconcile_once().await {
-                        error!(error = ?e, "failed to reconcile");
-                    }
-                }
+                event = watch_stream.next() => match event {
+                    Some(Ok(event)) => block_in_place(|| self.apply_watch_event(event)),
+                    Some(Err(e)) => warn!(error = ?e, "watch stream error; resync will resseed"),
+                    None => warn!("watch stream closed; resync will reseed"),
+                },
+                  _ = resync_interval.tick() => {
+                      if let Err(e) = self.resync().await {
+                          error!(error = ?e, "resync failed");
+                      }
+                  }
+                  _ = liveness_interval.tick() => block_in_place(|| self.tick_liveness()),
             }
         }
 
@@ -90,12 +123,131 @@ impl<R: RuntimeClient> Reconciler<R> {
         Ok(())
     }
 
-    async fn reconcile_once(&mut self) -> Result<()> {
-        let desired = watcher::scan(&self.manifests_dir)
+    async fn startup(&mut self) -> Result<()> {
+        let recovered = block_in_place(|| self.runtime.recover_all())
+            .context("recover containers from runtime state dir")?;
+        info!(
+            count = recovered.len(),
+            "recovered containers from runtime state"
+        );
+
+        let initial_pods = self
+            .client
+            .list_pods()
             .await
-            .context("scanning manifests")?;
+            .context("initial list of pods from apiserver")?;
+        info!(count = initial_pods.len(), "listed pods from apiserver");
+
+        // Group recovered containers by pod name (the "{pod}__" prefix).
+        let mut by_pod: HashMap<String, Vec<RecoveredContainer>> = HashMap::new();
+        for rc in recovered {
+            if let Some((pod_name, _)) = rc.id.split_once("__") {
+                by_pod.entry(pod_name.to_string()).or_default().push(rc);
+            }
+        }
+
+        for pod in initial_pods {
+            let name = pod.metadata.name.clone();
+            let pause_id = format!("{name}__pause");
+
+            let recovered_for_pod = by_pod.remove(&name);
+            match recovered_for_pod
+                .as_ref()
+                .and_then(|rcs| rcs.iter().find(|rc| rc.id == pause_id))
+                .and_then(|p| p.pid)
+            {
+                Some(pause_pid) => {
+                    let app_names: Vec<String> = recovered_for_pod
+                        .unwrap()
+                        .into_iter()
+                        .filter(|rc| rc.id != pause_id)
+                        .filter_map(|rc| rc.id.split_once("__").map(|(_, n)| n.to_string()))
+                        .collect();
+                    info!(pod = %name, pause_pid, apps = app_names.len(),
+                            "reattached recovered sandbox");
+                    let sandbox = PodSandbox::from_recovered(
+                        name.clone(),
+                        pause_pid,
+                        app_names,
+                        self.pods_dir.clone(),
+                        self.rootfs_base.clone(),
+                    );
+                    self.store.insert(PodState {
+                        pod: pod.clone(),
+                        sandbox,
+                    });
+                }
+                None => {
+                    info!(pod = %name, "no recovered pause; creating fresh sandbox");
+                    if let Err(e) = block_in_place(|| self.create_pod(&pod)) {
+                        error!(error = ?e, pod = %name, "create failed during startup");
+                    }
+                }
+            }
+            self.cache.insert(name, pod);
+        }
+
+        for (orphan_pod, containers) in by_pod {
+            warn!(pod = %orphan_pod, count = containers.len(),
+                    "orphan containers (not in apiserver); destroying");
+            for rc in containers {
+                if let Err(e) = self.runtime.delete_container(&rc.id, true) {
+                    error!(error = ?e, id = %rc.id, "failed to delete orphan");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_watch_event(&mut self, event: WatchEvent) {
+        let name = event.object.metadata.name.clone();
+        let _span = info_span!("watch", pod = %name, ty = ?event.event_type).entered();
+        match event.event_type {
+            WatchEventType::Added | WatchEventType::Modified => {
+                let pod = event.object;
+                let is_new = !self.cache.contains_key(&name);
+                self.cache.insert(name.clone(), pod.clone());
+                if is_new && let Err(e) = self.create_pod(&pod) {
+                    error!(error = ?e, "failed to create pod");
+                }
+            }
+            WatchEventType::Deleted => {
+                self.cache.remove(&name);
+                if let Err(e) = self.remove_pod(&name) {
+                    error!(error = ?e, "failed to remove pod");
+                }
+            }
+        }
+    }
+
+    async fn resync(&mut self) -> Result<()> {
+        let pods = self.client.list_pods().await.context("resync list")?;
+        let desired: HashMap<PodName, Pod> = pods
+            .into_iter()
+            .map(|p| (p.metadata.name.clone(), p))
+            .collect();
+        self.cache = desired.clone();
         block_in_place(|| self.apply_diff(&desired));
         Ok(())
+    }
+
+    fn tick_liveness(&mut self) {
+        let names = self.cache.keys().cloned().collect::<Vec<PodName>>();
+        for name in names {
+            if let Some(pod) = self.cache.get(&name).cloned() {
+                let _span = info_span!("liveness", pod = %name).entered();
+                if let Err(e) = self.reconcile_liveness(&name, &pod) {
+                    error!(error = ?e, "liveness failed");
+                }
+            }
+        }
+
+        if self.debug_dump_path.is_some()
+            && let Err(e) = self.write_debug_snapshot()
+        {
+            warn!(error = ?e, "failed to write debug snapshot");
+        }
     }
 
     fn apply_diff(&mut self, desired: &HashMap<PodName, Pod>) {
@@ -338,7 +490,7 @@ mod tests {
     use std::path::Path;
 
     use crate::pod::{Container, PodMetadata, PodSpec};
-    use crate::runtime::{Result as RuntimeResult, RuntimeError};
+    use crate::runtime::{RecoveredContainer, Result as RuntimeResult, RuntimeError};
 
     /// Mock runtime. Records every call. Killed containers automatically
     /// report Stopped on subsequent state queries (simulates termination)
@@ -403,6 +555,12 @@ mod tests {
             self.calls.push(format!("pid({id})"));
             Ok(self.pids.get(id).copied())
         }
+
+        fn recover_all(&mut self) -> RuntimeResult<Vec<RecoveredContainer>> {
+            // Reconciler tests never exercise restart recovery directly;
+            // they build sandboxes through the normal create() path.
+            Ok(Vec::new())
+        }
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
@@ -441,15 +599,12 @@ mod tests {
 
     fn make_reconciler(label: &str) -> Reconciler<MockRuntime> {
         let pods_dir = unique_temp_dir(label);
-        let manifests_dir = unique_temp_dir(&format!("{label}-manifests"));
         let rootfs = std::env::temp_dir().join("nonexistent-rootfs");
-        Reconciler::new(
-            manifests_dir,
-            pods_dir,
-            rootfs,
-            MockRuntime::default(),
-            None,
-        )
+        // Dummy Client — tests drive apply_diff directly and never hit HTTP.
+        // Pointing at a closed port catches any accidental call with a fast
+        // ConnectionRefused instead of hanging.
+        let client = Arc::new(Client::new("http://127.0.0.1:1"));
+        Reconciler::new(client, pods_dir, rootfs, MockRuntime::default(), None)
     }
 
     fn desired_map(pods: Vec<Pod>) -> HashMap<PodName, Pod> {

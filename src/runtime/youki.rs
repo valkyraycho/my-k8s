@@ -8,6 +8,8 @@ use libcontainer::{
 };
 use nix::sys::signal::Signal;
 
+use crate::runtime::RecoveredContainer;
+
 use super::{ContainerState, Result, RuntimeClient, RuntimeError};
 
 pub struct YoukiRuntime {
@@ -95,5 +97,46 @@ impl RuntimeClient for YoukiRuntime {
             .get_mut(id)
             .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
         Ok(container.pid().map(|p| p.as_raw() as u32))
+    }
+
+    fn recover_all(&mut self) -> Result<Vec<RecoveredContainer>> {
+        let mut recovered = Vec::new();
+        if !self.state_dir.exists() {
+            return Ok(recovered);
+        }
+
+        let entries = std::fs::read_dir(&self.state_dir)
+            .with_context(|| format!("reading state dir {:?}", self.state_dir))?;
+
+        for entry in entries {
+            let entry = entry.context("reading state dir entry")?;
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+
+            let container_root = entry.path();
+
+            if !container_root.join("state.json").exists() {
+                continue;
+            }
+
+            let id = entry.file_name().to_string_lossy().into_owned();
+
+            let container = Container::load(container_root)
+                .with_context(|| format!("Container::load for {id}"))?;
+
+            let state = match container.status() {
+                ContainerStatus::Created | ContainerStatus::Creating => ContainerState::Created,
+                ContainerStatus::Running | ContainerStatus::Paused => ContainerState::Running,
+                ContainerStatus::Stopped => ContainerState::Stopped,
+            };
+
+            let pid = container.pid().map(|p| p.as_raw() as u32);
+
+            self.containers.insert(id.clone(), container);
+            recovered.push(RecoveredContainer { id, state, pid });
+        }
+
+        Ok(recovered)
     }
 }

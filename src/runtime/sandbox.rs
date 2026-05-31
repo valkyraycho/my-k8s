@@ -37,6 +37,24 @@ impl PodSandbox {
         }
     }
 
+    pub fn from_recovered(
+        pod_name: PodName,
+        pause_pid: u32,
+        app_container_names: Vec<String>,
+        pods_dir: PathBuf,
+        rootfs_base: PathBuf,
+    ) -> Self {
+        let pause_id = format!("{pod_name}__pause");
+        Self {
+            pod_name,
+            pause_id,
+            pause_pid: Some(pause_pid),
+            app_containers: app_container_names,
+            pods_dir,
+            rootfs_base,
+        }
+    }
+
     pub fn pod_name(&self) -> &PodName {
         &self.pod_name
     }
@@ -216,7 +234,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
 
-    use crate::runtime::{Result as RuntimeResult, RuntimeClient};
+    use crate::runtime::{RecoveredContainer, Result as RuntimeResult, RuntimeClient};
 
     /// Records every trait call and serves canned responses. Lets us drive
     /// PodSandbox through every state without libcontainer or root.
@@ -263,6 +281,10 @@ mod tests {
         fn container_pid(&mut self, id: &str) -> RuntimeResult<Option<u32>> {
             self.calls.push(format!("pid({id})"));
             Ok(self.pids.get(id).copied())
+        }
+        fn recover_all(&mut self) -> RuntimeResult<Vec<RecoveredContainer>> {
+            // Sandbox tests never recover; nothing to enumerate.
+            Ok(Vec::new())
         }
     }
 
@@ -381,6 +403,32 @@ mod tests {
             !post.iter().any(|c| c.starts_with("state(")),
             "no state polling should occur after NotFound on kill",
         );
+    }
+
+    #[test]
+    fn from_recovered_populates_fields_without_touching_runtime() {
+        let pods_dir = unique_temp_dir("from-recovered");
+        let rootfs = std::env::temp_dir().join("nonexistent-rootfs");
+
+        let sandbox = PodSandbox::from_recovered(
+            "test-pod".into(),
+            9999,
+            vec!["web".into(), "log-tail".into()],
+            pods_dir,
+            rootfs,
+        );
+
+        // pause_id is derived from pod_name; restart-recovery must reconstruct
+        // the same id the original create() would have produced.
+        assert_eq!(sandbox.pod_name(), "test-pod");
+        assert_eq!(sandbox.pause_pid(), Some(9999));
+        assert_eq!(
+            sandbox.app_container_names(),
+            &["web".to_string(), "log-tail".to_string()],
+        );
+        assert!(sandbox.contains_container("web"));
+        assert!(sandbox.contains_container("log-tail"));
+        assert!(!sandbox.contains_container("nope"));
     }
 
     #[test]

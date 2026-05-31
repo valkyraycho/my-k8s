@@ -10,4 +10,3 @@ pub mod pod;
 pub mod reconciler;
 pub mod runtime;
 pub mod store;
-pub mod watcher;
