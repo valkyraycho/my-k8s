@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -7,16 +8,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use my_k8s::{reconciler::Reconciler, runtime::youki::YoukiRuntime};
+use my_k8s::{client::Client, reconciler::Reconciler, runtime::youki::YoukiRuntime};
 
-/// my-k8s kubelet — watches a manifests directory and runs the Pods inside it.
+/// my-k8s kubelet — syncs Pods from the apiserver and runs them on this node.
 #[derive(Debug, Parser)]
 #[command(name = "kubelet", version)]
 struct Args {
-    /// Directory containing Pod manifest YAML files (the "desired state").
-    /// Created on startup if missing.
-    #[arg(long, default_value = "./manifests/active")]
-    manifests_dir: PathBuf,
+    /// Base URL of the apiserver (the source of desired state).
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    api_server_url: String,
 
     /// Where libcontainer keeps per-container state (analogous to runc's --root).
     /// Created on startup if missing.
@@ -31,7 +31,6 @@ struct Args {
 
 impl Args {
     fn validate_and_prepare(&self) -> Result<()> {
-        ensure_dir(&self.manifests_dir).context("preparing manifests dir")?;
         ensure_dir(&self.state_dir).context("preparing state dir")?;
         ensure_dir(&self.pods_dir()).context("preparing pods dir")?;
         if !self.rootfs_base.is_dir() {
@@ -67,8 +66,9 @@ async fn main() -> Result<()> {
     info!(?args, "kubelet starting");
 
     let runtime = YoukiRuntime::new(args.state_dir.clone());
+    let client = Arc::new(Client::new(args.api_server_url.clone()));
     let reconciler = Reconciler::new(
-        args.manifests_dir.clone(),
+        client,
         args.pods_dir(),
         args.rootfs_base.clone(),
         runtime,

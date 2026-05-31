@@ -12,8 +12,8 @@ use tracing::{error, info, info_span, warn};
 
 use crate::{
     apiserver::watch::{WatchEvent, WatchEventType},
-    client::Client,
-    pod::{Pod, PodName},
+    client::{Client, ClientError},
+    pod::{ContainerStatus, ContainerStatusState, Pod, PodName, PodPhase, PodStatus},
     runtime::{ContainerState, RecoveredContainer, RuntimeClient, sandbox::PodSandbox},
     store::{PodState, Store},
 };
@@ -57,6 +57,7 @@ pub struct Reconciler<R: RuntimeClient> {
     restart_state: HashMap<String, RestartTracker>,
     debug_dump_path: Option<PathBuf>,
     cache: HashMap<PodName, Pod>,
+    last_pushed_status: HashMap<PodName, PodStatus>,
 }
 
 impl<R: RuntimeClient> Reconciler<R> {
@@ -76,6 +77,7 @@ impl<R: RuntimeClient> Reconciler<R> {
             restart_state: HashMap::new(),
             debug_dump_path,
             cache: HashMap::new(),
+            last_pushed_status: HashMap::new(),
         }
     }
 
@@ -114,7 +116,14 @@ impl<R: RuntimeClient> Reconciler<R> {
                           error!(error = ?e, "resync failed");
                       }
                   }
-                  _ = liveness_interval.tick() => block_in_place(|| self.tick_liveness()),
+                  _ = liveness_interval.tick() => {
+                    let dirty = block_in_place(|| self.tick_liveness());
+                    for (name, status) in dirty {
+                        if let Err(e) = self.push_status(&name, &status).await {
+                            error!(error = ?e, "push status failed");
+                        }
+                    }
+                  },
             }
         }
 
@@ -232,14 +241,23 @@ impl<R: RuntimeClient> Reconciler<R> {
         Ok(())
     }
 
-    fn tick_liveness(&mut self) {
+    fn tick_liveness(&mut self) -> Vec<(PodName, PodStatus)> {
         let names = self.cache.keys().cloned().collect::<Vec<PodName>>();
+        let mut dirty: Vec<(PodName, PodStatus)> = Vec::new();
+
         for name in names {
-            if let Some(pod) = self.cache.get(&name).cloned() {
-                let _span = info_span!("liveness", pod = %name).entered();
-                if let Err(e) = self.reconcile_liveness(&name, &pod) {
-                    error!(error = ?e, "liveness failed");
-                }
+            let Some(pod) = self.cache.get(&name).cloned() else {
+                continue;
+            };
+
+            let _span = info_span!("liveness", pod = %name).entered();
+            if let Err(e) = self.reconcile_liveness(&name, &pod) {
+                error!(error = ?e, "liveness failed");
+            }
+
+            let new_status = self.compute_pod_status(&pod);
+            if self.last_pushed_status.get(&name).as_ref() != Some(&&new_status) {
+                dirty.push((name.clone(), new_status));
             }
         }
 
@@ -247,6 +265,73 @@ impl<R: RuntimeClient> Reconciler<R> {
             && let Err(e) = self.write_debug_snapshot()
         {
             warn!(error = ?e, "failed to write debug snapshot");
+        }
+
+        dirty
+    }
+
+    fn compute_pod_status(&mut self, pod: &Pod) -> PodStatus {
+        let name = &pod.metadata.name;
+        let mut container_statuses = Vec::with_capacity(pod.spec.containers.len());
+        let mut any_waiting = false;
+        let mut any_running = false;
+        let mut all_terminated = !pod.spec.containers.is_empty();
+
+        for c in &pod.spec.containers {
+            let id = format!("{}__{}", name, c.name);
+            let state = self
+                .runtime
+                .container_state(&id)
+                .unwrap_or(ContainerState::NotFound);
+            let restart_count = self
+                .restart_state
+                .get(&id)
+                .map(|t| t.restart_count)
+                .unwrap_or(0);
+
+            let (cs_state, ready) = match state {
+                ContainerState::Running => {
+                    any_running = true;
+                    all_terminated = false;
+                    (
+                        ContainerStatusState::Running {
+                            started_at: "unknown".into(),
+                        },
+                        true,
+                    )
+                }
+                ContainerState::Created | ContainerState::NotFound => {
+                    any_waiting = true;
+                    all_terminated = false;
+                    (ContainerStatusState::Waiting, false)
+                }
+                ContainerState::Stopped => {
+                    (ContainerStatusState::Terminated { exit_code: 0 }, false)
+                }
+            };
+
+            container_statuses.push(ContainerStatus {
+                name: c.name.clone(),
+                state: cs_state,
+                restart_count,
+                ready,
+            });
+        }
+
+        let phase = if any_waiting {
+            PodPhase::Pending
+        } else if all_terminated {
+            PodPhase::Failed
+        } else if any_running {
+            PodPhase::Running
+        } else {
+            PodPhase::Unknown
+        };
+
+        PodStatus {
+            phase,
+            container_statuses,
+            observed_generation: pod.metadata.generation,
         }
     }
 
@@ -330,6 +415,7 @@ impl<R: RuntimeClient> Reconciler<R> {
                 let container_id = format!("{name}__{}", container.name);
                 self.restart_state.remove(&container_id);
             }
+            self.last_pushed_status.remove(name);
             state.sandbox.destroy(&mut self.runtime)?;
         }
         Ok(())
@@ -468,6 +554,51 @@ impl<R: RuntimeClient> Reconciler<R> {
         std::fs::write(path, serde_json::to_string_pretty(&snapshot)?)
             .with_context(|| format!("writing debug snapshot to {path:?}"))?;
         Ok(())
+    }
+
+    async fn push_status(&mut self, name: &PodName, status: &PodStatus) -> Result<()> {
+        let rv = match self
+            .cache
+            .get(name)
+            .and_then(|p| p.metadata.resource_version.clone())
+        {
+            Some(rv) => rv,
+            None => return Ok(()),
+        };
+
+        match self.client.replace_pod_status(name, status, &rv).await {
+            Ok(updated) => {
+                self.cache.insert(name.clone(), updated);
+                self.last_pushed_status.insert(name.clone(), status.clone());
+                Ok(())
+            }
+            Err(ClientError::Conflict { .. }) => {
+                let latest = self
+                    .client
+                    .get_pod(name)
+                    .await
+                    .context("refetch on status conflict")?;
+                let Some(latest) = latest else {
+                    return Ok(());
+                };
+                let new_rv = latest
+                    .metadata
+                    .resource_version
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("refetched pod missing rv"))?;
+                self.cache.insert(name.clone(), latest);
+                let updated = self
+                    .client
+                    .replace_pod_status(name, status, &new_rv)
+                    .await
+                    .context("status push retry after conflict")?;
+
+                self.cache.insert(name.clone(), updated);
+                self.last_pushed_status.insert(name.clone(), status.clone());
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!(e)).context("status push "),
+        }
     }
 }
 
@@ -851,6 +982,102 @@ mod tests {
             r.runtime
                 .calls
                 .contains(&"delete(b__pause,force=true)".to_string())
+        );
+    }
+
+    // ---- compute_pod_status: phase rollup precedence ----
+
+    #[test]
+    fn compute_status_running_when_all_containers_running() {
+        let mut r = make_reconciler("status-running");
+        let pod = make_pod("web", vec![("a", vec!["sleep"]), ("b", vec!["sleep"])]);
+        // MockRuntime defaults unknown ids to Running.
+        let status = r.compute_pod_status(&pod);
+        assert_eq!(status.phase, PodPhase::Running);
+        assert_eq!(status.container_statuses.len(), 2);
+        assert!(
+            status.container_statuses.iter().all(|c| c.ready),
+            "running containers should be ready",
+        );
+    }
+
+    #[test]
+    fn compute_status_pending_when_any_container_waiting() {
+        let mut r = make_reconciler("status-pending");
+        let pod = make_pod("web", vec![("a", vec!["sleep"]), ("b", vec!["sleep"])]);
+        // a is Running (default), b is still Created → whole pod is Pending.
+        r.runtime
+            .state_seq
+            .insert("web__b".into(), vec![ContainerState::Created]);
+        let status = r.compute_pod_status(&pod);
+        assert_eq!(
+            status.phase,
+            PodPhase::Pending,
+            "any waiting container forces Pending, even if others are Running",
+        );
+    }
+
+    #[test]
+    fn compute_status_failed_when_all_containers_stopped() {
+        let mut r = make_reconciler("status-failed");
+        let pod = make_pod("web", vec![("a", vec!["sleep"]), ("b", vec!["sleep"])]);
+        r.runtime
+            .state_seq
+            .insert("web__a".into(), vec![ContainerState::Stopped]);
+        r.runtime
+            .state_seq
+            .insert("web__b".into(), vec![ContainerState::Stopped]);
+        let status = r.compute_pod_status(&pod);
+        assert_eq!(status.phase, PodPhase::Failed);
+        assert!(
+            status.container_statuses.iter().all(|c| !c.ready),
+            "stopped containers are not ready",
+        );
+    }
+
+    #[test]
+    fn compute_status_carries_restart_count_and_generation() {
+        let mut r = make_reconciler("status-meta");
+        let mut pod = make_pod("web", vec![("a", vec!["sleep"])]);
+        pod.metadata.generation = Some(7);
+        r.restart_state.insert(
+            "web__a".into(),
+            RestartTracker {
+                restart_count: 3,
+                next_retry_at: Instant::now(),
+            },
+        );
+        let status = r.compute_pod_status(&pod);
+        assert_eq!(
+            status.observed_generation,
+            Some(7),
+            "observed_generation echoes the spec generation",
+        );
+        assert_eq!(status.container_statuses[0].restart_count, 3);
+    }
+
+    // ---- tick_liveness: dirty detection + dedup ----
+
+    #[test]
+    fn tick_liveness_marks_dirty_then_dedups_after_push() {
+        let mut r = make_reconciler("dedup");
+        let pod = make_pod("web", vec![("a", vec!["sleep"])]);
+        r.cache.insert("web".into(), pod);
+
+        // First tick: nothing pushed yet → web's status is dirty.
+        let dirty1 = r.tick_liveness();
+        assert_eq!(dirty1.len(), 1);
+        assert_eq!(dirty1[0].0, "web");
+
+        // Simulate a successful push by recording what we just computed.
+        let (name, status) = dirty1.into_iter().next().unwrap();
+        r.last_pushed_status.insert(name, status);
+
+        // Second tick, state unchanged: computed == last pushed → not dirty.
+        let dirty2 = r.tick_liveness();
+        assert!(
+            dirty2.is_empty(),
+            "unchanged status must be deduped to avoid spurious /status PUTs",
         );
     }
 }
