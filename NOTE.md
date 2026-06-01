@@ -624,9 +624,9 @@ This is *the* move that makes K8s K8s: once desired state lives behind an API wi
 
 **New crates:** `axum` (HTTP server), `sled` (embedded KV store — our stand-in for etcd), `reqwest` (HTTP client), `uuid` + `chrono` (identity + timestamps), `tokio-stream` / `async-stream` (the watch stream), `tower` (dev-dep, for testing axum handlers via `oneshot`).
 
-**Status as of this writing.** The library, the `apiserver` binary, and the `Client` are complete and tested (`cargo check --lib` and the apiserver bin are green; storage/watch/handlers/client all have unit + integration tests). The **`kubelet` binary entrypoint is NOT yet migrated** — `src/reconciler.rs` now wants an `Arc<Client>` but `src/bin/kubelet.rs` still passes a `PathBuf` (the old `manifests_dir`), so `cargo check --bin kubelet` fails with a type mismatch. The reconciler *logic* is done and unit-tested against a mock; what remains is wiring the bin to build a `Client`, add an `--apiserver-url` flag, and drop the dead `manifests_dir`/`watcher` plumbing. (`src/watcher.rs` was already deleted — the apiserver replaces it.)
+**Status as of this writing.** The full vertical slice now compiles and tests green: library, `apiserver` binary, `Client`, and the migrated `kubelet` binary. `cargo check --all-targets` is clean. The kubelet reads desired state from the apiserver (informer loop, §7) *and* reports observed state back (status loop, §8). `src/watcher.rs` is gone — the apiserver replaces the directory watch. What's left for a full Phase 2 demo is an end-to-end run in the VM (apiserver + kubelet + `curl`-driven Pod create → container runs → status reported), plus a `mykubectl` client; the pieces are wired but the live multi-process demo hasn't been recorded here yet.
 
-The order below mirrors the dependency order: wire types → storage → watch → HTTP surface → server bin → client → the kubelet's new informer loop.
+The order below mirrors the dependency order: wire types → storage → watch → HTTP surface → server bin → client → the kubelet's informer loop → the kubelet's status loop.
 
 ## 1. Wire format — Pod gains status + apiserver metadata (`src/pod.rs`)
 
@@ -819,4 +819,68 @@ This is how a real kubelet survives its own restart without disturbing running P
 
 **Gotcha — `RuntimeClient` grew `recover_all`.** Adding a trait method means every impl must provide it. `YoukiRuntime` walks the state dir for real; `MockRuntime` returns an empty `Vec`, so the Phase 1 mock-based reconciler/sandbox tests still pass unchanged (they never recover).
 
-**Current gap (honest status).** The reconciler *logic* above compiles and is unit-tested via the mock, but the `kubelet` binary entrypoint hasn't been migrated: `src/bin/kubelet.rs:71` still passes `args.manifests_dir` (a `PathBuf`) where `Reconciler::new` now wants `Arc<Client>`, so `cargo check --bin kubelet` fails. Remaining work to make the kubelet runnable end-to-end: construct a `Client`, add an `--apiserver-url` flag, drop the obsolete `manifests_dir` arg, and delete the dead directory-watch wiring. The apiserver side is fully runnable today.
+**Resolved since first draft.** The kubelet entrypoint is now migrated (see §8) — `Reconciler::new` is fed an `Arc<Client>`, and `cargo check --all-targets` is clean. This section's "reads desired state" half is complete; §8 adds the "reports observed state back" half.
+
+## 8. Kubelet as a full client — reporting status back (`src/bin/kubelet.rs` + `src/reconciler.rs`)
+
+This closes the loop the whole phase has been building toward. Heavy.
+
+**The bin migration (the gap from earlier, now closed).** `src/bin/kubelet.rs` dropped `--manifests-dir` and gained `--api-server-url` (default `http://127.0.0.1:8080`). It constructs `Arc::new(Client::new(url))` and hands that to `Reconciler::new`. The kubelet is now a *true apiserver client*: it no longer reads any local directory — desired state arrives over HTTP via the watch (§7), and observed state goes back over HTTP via status writes (below).
+
+**Concept — the two halves of a control loop.** Reconciliation isn't only "make actual match desired." It's also "publish what actual *is*, so everyone else can see it." Phase 1 only ever had the local `debug.json` snapshot (§14) — observed state that never left the node. Now the kubelet writes a real `PodStatus` back to the apiserver:
+```
+        ┌─────────────── apiserver (source of truth) ───────────────┐
+        │  spec (desired)                         status (observed)  │
+        └───────▲───────────────────────────────────────▲───────────┘
+                │ watch / list (§7)                       │ PUT /status (§8)
+        desired │  flows DOWN                    observed │  flows UP
+                │                                         │
+        ┌───────┴─────────────────────────────────────────┴─────────┐
+        │  kubelet:  run containers to match spec  →  observe  →  report│
+        └───────────────────────────────────────────────────────────┘
+```
+With status flowing up, a `kubectl get pods` (future) — or any other client — can see whether a Pod is actually Running without touching the node. This is why K8s status is a first-class, separately-written subresource.
+
+**Concept — `compute_pod_status`: rolling container states up into one phase.** For each container the kubelet reads its runtime state and maps it to a `ContainerStatusState` + `ready` flag, then rolls the set up into a single Pod `phase` by **precedence**:
+```
+   any container Waiting (Created / NotFound)   → Pending    ← checked FIRST
+   else all containers Stopped                  → Failed
+   else any container Running                   → Running
+   else                                         → Unknown
+```
+Order matters: a Pod with one container still starting is `Pending` *even if* a sibling is already `Running` — "not fully up yet" dominates. `observed_generation` is set to the spec's `metadata.generation`, so a reader can tell *which* spec revision this status reflects (the §2 generation-vs-rv idea, now consumed).
+
+**Gotcha — two honest placeholders.** `started_at` is the literal string `"unknown"` (we don't track real start timestamps yet), and a `Stopped` container reports `exit_code: 0` unconditionally (we don't capture real exit codes yet). Both are visible Phase 2 shortcuts, not finished behavior — flagged here so a future reader doesn't trust those two fields.
+
+**Concept — level-triggered dedup (`last_pushed_status`).** The liveness tick fires every 2s, but a Pod's status rarely changes that often. Re-PUTting an identical status each tick would: bump `resourceVersion` for nothing, wake every watcher, and spam the apiserver. So `tick_liveness` now returns a *dirty set* — only the `(name, status)` pairs where the freshly-computed status differs from `last_pushed_status[name]`:
+```
+   tick: compute status for each cached pod
+         computed == last_pushed?  → skip (not dirty)
+         computed != last_pushed?  → add to dirty set, will push
+   (last_pushed_status[name] cleared when the pod is removed, so the map can't grow unbounded)
+```
+This is *level-triggered* reporting: push on **change**, not on schedule. Same instinct as the reconcile loop itself (act on the diff, not the clock). Pinned by `tick_liveness_marks_dirty_then_dedups_after_push`.
+
+**Concept — `push_status`: optimistic concurrency from the client side.** The `/status` endpoint requires `?resourceVersion=` (§4), so a status write is a read-modify-write against the version the kubelet last saw:
+```
+   1. rv = cache[name].resourceVersion
+   2. PUT /pods/name/status?resourceVersion=rv  with the computed status
+        ├─ Ok(updated)        → cache[name] = updated; last_pushed_status[name] = status
+        └─ Err(Conflict)      → someone advanced rv first (a spec edit, or our own resync
+                                replaced the cache). Refetch the pod, take its fresh rv,
+                                retry the PUT ONCE with the new rv.
+```
+This is the §2 optimistic-concurrency dance, now driven from the client. The conflict is expected, not exceptional: the cached rv goes stale any time the apiserver advances it. The retry is a *single* bounded refetch-and-reapply — if it conflicts again, we give up and let the next 2s tick try fresh. (A retry *loop* would risk livelock against a hot-edited Pod; one shot keeps it simple and the tick provides natural backoff.)
+
+**Decision — why the push lives in the liveness arm, split sync/async.** `tick_liveness` is synchronous and runs inside `block_in_place` (it makes blocking libcontainer calls, §7/§10). But `push_status` is async (HTTP). So the run loop does:
+```rust
+_ = liveness_interval.tick() => {
+    let dirty = block_in_place(|| self.tick_liveness());   // sync: compute under block_in_place
+    for (name, status) in dirty {
+        self.push_status(&name, &status).await;            // async: network writes outside it
+    }
+}
+```
+Compute synchronously (where the blocking runtime calls are), then `await` the network writes *outside* `block_in_place`. Mixing an `.await` inside `block_in_place` would be wrong — `block_in_place` is for blocking *sync* work, not for parking on a future. This clean split is the idiomatic way to bridge the sync runtime layer and the async client layer.
+
+**Validation.** `cargo check --all-targets` clean; full suite **76 tests, all passing** (up from Phase 1's 36) — including the four new `compute_status_*` phase-rollup tests and the `tick_liveness` dirty/dedup test.
