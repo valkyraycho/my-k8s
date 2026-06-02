@@ -1,3 +1,6 @@
+//! Translates our `Container` type into an OCI runtime `Spec` (`config.json`)
+//! that libcontainer can instantiate. The bridge between Pod-world and OCI-world.
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -8,21 +11,34 @@ use oci_spec::runtime::{
 
 use crate::pod::Container;
 
+/// Build the OCI `Spec`. The one knob that matters is `share_namespaces_from_pid`:
+/// `None` → pause container (creates fresh namespaces); `Some(pid)` → app
+/// container (joins the pause's net/ipc/uts). See [`build_namespaces`].
+///
+/// A *pure* function (inputs → `Spec`, no I/O) — easy to unit-test without root,
+/// which is why the namespace-wiring tests live against this and not the runtime.
 pub fn build_spec(
     container: &Container,
     rootfs_base: &Path,
     share_namespaces_from_pid: Option<u32>,
 ) -> Result<Spec> {
+    // Rust idiom — the builder pattern (`oci-spec` uses `derive_builder`):
+    // chained owned-self setters then a `.build()` that VALIDATES and returns
+    // `Result`, hence the `?` on every builder. Verbose, but type-checked —
+    // far safer than hand-assembling the config.json by hand.
     let process = ProcessBuilder::default()
         .terminal(false)
         .user(UserBuilder::default().uid(0u32).gid(0u32).build()?)
         .args(container.command.clone())
         .env(vec!["PATH=/bin".into(), "HOME=/".into()])
         .cwd("/")
-        .no_new_privileges(true)
+        .no_new_privileges(true) // hardening: child can't gain privs via setuid
         .build()
         .context("building process spec")?;
 
+    // readonly(true): every container shares ONE on-disk rootfs, so read-only
+    // stops one from corrupting another. Writable scratch comes from the /tmp
+    // tmpfs mount below.
     let root = RootBuilder::default()
         .path(rootfs_base.to_path_buf())
         .readonly(true)
@@ -88,9 +104,17 @@ pub fn build_spec(
     Ok(spec)
 }
 
+/// The heart of the Pod model. A namespace entry with NO `path` means "create
+/// a fresh one"; a `path` of `/proc/PID/ns/X` means "join the existing one
+/// owned by PID" (libcontainer `setns(2)`s into it before exec).
+///
+/// - PID + mount: always fresh (own process tree, own filesystem view).
+/// - net + ipc + uts: fresh for the pause (`None`), but JOINED for app
+///   containers (`Some(pause_pid)`) — that's what gives a Pod one shared IP.
 fn build_namespaces(share_namespaces_from_pid: Option<u32>) -> Result<Vec<LinuxNamespace>> {
     let mut namespaces: Vec<LinuxNamespace> = Vec::new();
 
+    // Per-container namespaces: never shared, so no `path` is ever set.
     for ty in [LinuxNamespaceType::Pid, LinuxNamespaceType::Mount] {
         namespaces.push(
             LinuxNamespaceBuilder::default()
@@ -100,6 +124,9 @@ fn build_namespaces(share_namespaces_from_pid: Option<u32>) -> Result<Vec<LinuxN
         );
     }
 
+    // Shared-from-pause namespaces: setting `.path(...)` only when we have a
+    // pid is the whole pause/app distinction. `if let Some` on the Option is
+    // the idiomatic "do this only when present" — no null, no unwrap.
     for (ty, ns_name) in [
         (LinuxNamespaceType::Network, "net"),
         (LinuxNamespaceType::Ipc, "ipc"),

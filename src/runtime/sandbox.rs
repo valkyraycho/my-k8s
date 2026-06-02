@@ -11,10 +11,19 @@ use crate::{
     runtime::{ContainerState, RuntimeClient, RuntimeError, bundle::write_bundle},
 };
 
+/// How long to wait for a container to exit after SIGTERM before force-killing.
 const TERMINATION_GRACE: Duration = Duration::from_secs(5);
 
+/// How often to poll container state while waiting out the grace period.
 const POLLING_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Owns one Pod's lifecycle. The `pause_pid` is the linchpin: the pause
+/// container is a do-nothing process that *holds* the shared net/ipc/uts
+/// namespaces, so app containers (which join `/proc/{pause_pid}/ns/*`) keep
+/// their network identity even across their own restarts.
+///
+/// `pause_pid: Option<u32>` — `None` until `create()` runs (a sandbox exists
+/// as a value before its pause is started), `Some` afterward.
 pub struct PodSandbox {
     pod_name: PodName,
     pause_id: String,
@@ -37,6 +46,11 @@ impl PodSandbox {
         }
     }
 
+    /// Rebuild a sandbox handle for containers that survived a kubelet restart
+    /// (see reconciler `startup`). Unlike `new` + `create`, this does NOT touch
+    /// the runtime — the containers are already running. It just reconstructs
+    /// the same `pause_id`/`pause_pid`/app-name bookkeeping the original
+    /// `create()` produced, so subsequent calls line up with the live ids.
     pub fn from_recovered(
         pod_name: PodName,
         pause_pid: u32,
@@ -71,9 +85,14 @@ impl PodSandbox {
         self.app_containers.contains(&name.to_string())
     }
 
+    /// Generic over `R: RuntimeClient` (static dispatch) so the real
+    /// `YoukiRuntime` and the test `MockRuntime` share this exact code path —
+    /// monomorphized per type, no vtable. Pause MUST come up first: it mints
+    /// the namespaces every later container joins, and we must capture its pid.
     pub fn create<R: RuntimeClient>(&mut self, runtime: &mut R) -> Result<()> {
         let pause_container = pause_container_spec();
         let pause_bundle_dir = self.bundle_dir_for(&pause_container.name);
+        // `None` share-pid → the pause creates fresh namespaces (see bundle.rs).
         write_bundle(&pause_container, &pause_bundle_dir, &self.rootfs_base, None)
             .context("write pause bundle")?;
 
@@ -84,18 +103,27 @@ impl PodSandbox {
             .start_container(&self.pause_id)
             .context("start pause container")?;
 
+        // `?` then `.ok_or_else(...)?`: first `?` unwraps the Result, the
+        // ok_or_else turns the inner `Option<u32>` into an error if the pause
+        // has no pid (it must, right after a successful start).
         let pid = runtime
             .container_pid(&self.pause_id)
             .context("get pause container pid")?
             .ok_or_else(|| anyhow::anyhow!("pause container pid not found"))?;
         self.pause_pid = Some(pid);
 
+        // `#[cfg(not(test))]`: real loopback setup shells out to `nsenter`,
+        // which needs root + a real netns. Tests run without either, so this
+        // line is compiled OUT of test builds (the mock path skips networking).
         #[cfg(not(test))]
         setup_pod_network(pid).context("configure pod network")?;
 
         Ok(())
     }
 
+    /// Add an app container that JOINS the pause's namespaces. Requires
+    /// `create()` to have run first — enforced by reading `pause_pid` up front
+    /// (an unstarted sandbox has `None` → error, not a silent misconfig).
     pub fn add_container<R: RuntimeClient>(
         &mut self,
         runtime: &mut R,
@@ -125,6 +153,11 @@ impl PodSandbox {
         Ok(())
     }
 
+    /// Graceful-termination *policy* (SIGTERM → wait ≤grace → force delete)
+    /// lives here, NOT in `RuntimeClient`: the trait exposes mechanisms
+    /// (`kill_container`, `container_state`), the sandbox composes them into
+    /// policy. A different sandbox could choose a different grace without
+    /// touching the runtime layer.
     pub fn remove_container<R: RuntimeClient>(
         &mut self,
         runtime: &mut R,
@@ -134,6 +167,8 @@ impl PodSandbox {
 
         match runtime.kill_container(&container_id, libc::SIGTERM) {
             Ok(()) => {
+                // Poll until Stopped/NotFound or the grace deadline. Sync sleep
+                // is fine: the reconciler runs this inside `block_in_place`.
                 let deadline = Instant::now() + TERMINATION_GRACE;
                 while Instant::now() < deadline {
                     let state = runtime
@@ -145,23 +180,38 @@ impl PodSandbox {
                     std::thread::sleep(POLLING_INTERVAL);
                 }
             }
+            // SIGTERM failing (e.g. already gone) isn't fatal — fall through to
+            // delete, which is the thing that actually frees the state.
             Err(e) => {
                 warn!(error = ?e, %container_id, "SIGTERM failed during remove; proceeding to delete");
             }
         }
 
+        // Rust idiom — or-pattern in a match arm: treat "deleted" and "already
+        // NotFound" identically (both mean "it's gone, success"); only a real
+        // error propagates. Makes delete idempotent.
         match runtime.delete_container(&container_id, true) {
             Ok(()) | Err(RuntimeError::NotFound(_)) => {}
             Err(e) => return Err(e).context(format!("delete container {name}")),
         }
 
         let container_bundle_dir = self.bundle_dir_for(name);
+        // `let _ =`: best-effort cleanup; a leftover bundle dir is harmless, so
+        // we deliberately discard the Result rather than fail the removal.
         let _ = std::fs::remove_dir_all(&container_bundle_dir);
+        // `retain`: drop this name from the tracked set, keep the rest.
         self.app_containers.retain(|n| n != name);
         Ok(())
     }
 
+    /// Tear down in REVERSE dependency order: all app containers first, THEN
+    /// the pause. If the pause died first, every app container's shared
+    /// net/ipc/uts namespace would vanish out from under it mid-cleanup.
+    /// Errors are logged, not propagated — teardown is best-effort, we want to
+    /// get as far as possible rather than bail on the first failure.
     pub fn destroy<R: RuntimeClient>(&mut self, runtime: &mut R) -> Result<()> {
+        // Clone the names so we don't hold a borrow of `self.app_containers`
+        // while `remove_container` mutates it inside the loop.
         let names: Vec<String> = self.app_containers.clone();
 
         for name in &names {

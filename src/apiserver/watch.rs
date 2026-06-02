@@ -12,6 +12,8 @@ use crate::{
     pod::Pod,
 };
 
+/// One watch frame. `#[serde(rename = "type")]` — `type` is a Rust keyword, so
+/// the field is `event_type` in code but serializes to the K8s wire key `type`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WatchEvent {
@@ -20,6 +22,8 @@ pub struct WatchEvent {
     pub object: Pod,
 }
 
+/// `rename_all = "UPPERCASE"` matches K8s's `ADDED`/`MODIFIED`/`DELETED`.
+/// `Copy` because it's a trivial fieldless enum — cheaper to copy than borrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum WatchEventType {
@@ -38,14 +42,25 @@ pub enum WatchError {
     Store(#[from] StoreError),
 }
 
+/// Build a watch stream: a snapshot "catch-up" phase, then a live phase.
+///
+/// Returns `impl Stream` (return-position impl Trait) because `try_stream!`'s
+/// concrete type is unnameable. Correctness hinges on subscribing BEFORE the
+/// `list()` snapshot: any write landing in between is then buffered in the
+/// broadcast channel and replayed live (deduped by the rv filter), so nothing
+/// slips through the gap.
 pub fn stream_events(
     store: Arc<PodStore>,
     from_rv: u64,
 ) -> impl Stream<Item = Result<WatchEvent, WatchError>> {
+    // `try_stream!` lets us write a generator as straight-line async with
+    // `yield`, instead of hand-implementing `Stream::poll_next`. Inside it, `?`
+    // YIELDS the error as the final item and ends the stream.
     try_stream! {
-        let mut rx = store.subscribe();
+        let mut rx = store.subscribe();        // subscribe first — closes the list/subscribe race
         let (snapshot, snapshot_rv) = store.list()?;
 
+        // Catch-up: replay everything newer than the client's resume point.
         for pod in snapshot {
             if pod_rv(&pod) > from_rv {
                 yield WatchEvent {
@@ -55,6 +70,8 @@ pub fn stream_events(
             }
         }
 
+        // Live: forward broadcast events strictly newer than the snapshot, so an
+        // object present in BOTH phases isn't emitted twice.
         loop {
             match rx.recv().await {
                 Ok(ev) => {
@@ -62,10 +79,14 @@ pub fn stream_events(
                         yield ev
                     }
                 }
+                // Fell >channel-capacity behind: we can't silently skip (the
+                // client's cache would desync forever), so END the stream with
+                // an error → HTTP 410 → client re-lists. `?` does the terminate.
                 Err(RecvError::Lagged(skipped)) => {
                     warn!(skipped, "watch stream lagged; closing");
                     Err(WatchError::Lagged(skipped))?;
                 }
+                // Sender dropped (store gone) → clean end of stream.
                 Err(RecvError::Closed) => break,
             }
         }

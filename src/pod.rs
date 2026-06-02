@@ -1,15 +1,24 @@
-//! Pod schema and YAML parsing.
+//! Pod schema and (de)serialization.
 //!
-//! This is a deliberately tiny subset of the real Kubernetes Pod schema —
-//! enough to demonstrate the orchestration patterns in Phase 1. We DO model
-//! fields like `image` that we don't yet implement, so the schema is
-//! forward-compatible.
+//! A deliberately tiny subset of the real Kubernetes Pod schema. Phase 1
+//! used only `spec`; Phase 2 added `status` + apiserver-managed metadata so
+//! the type round-trips through the HTTP API. We model fields we don't yet
+//! implement (e.g. `image`) to keep the wire format forward-compatible.
 
 use serde::{Deserialize, Serialize};
+
+use crate::meta::ObjectMeta;
 
 pub type PodName = String;
 pub type ContainerName = String;
 
+/// The top-level resource. The `spec`/`status` split is fundamental to K8s:
+/// `spec` is *desired* state (written by clients), `status` is *observed*
+/// state (written by the kubelet, see reconciler `push_status`).
+///
+/// `#[serde(rename_all = "camelCase")]` maps every Rust `snake_case` field to
+/// K8s's `camelCase` wire keys (`api_version` ⇄ `apiVersion`) in one line, so
+/// snippets copy-paste straight from K8s docs.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pod {
@@ -17,23 +26,17 @@ pub struct Pod {
     pub kind: String,
     pub metadata: PodMetadata,
     pub spec: PodSpec,
+    // `skip_serializing_if`: a spec-only Pod (just submitted, no status yet)
+    // serializes with NO `status` key at all, rather than `"status": null`.
+    // `default`: deserializing a Pod that lacks the key yields `None`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub status: Option<PodStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct PodMetadata {
-    pub name: PodName,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub creation_timestamp: Option<String>,
-}
+/// Pod metadata is just the shared ObjectMeta. The alias keeps every existing
+/// `PodMetadata { .. }` call site compiling while unifying the type across
+/// resources (so the generic store in step 2 can treat them uniformly).
+pub type PodMetadata = ObjectMeta;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct PodSpec {
@@ -50,6 +53,9 @@ pub struct Container {
     pub command: Vec<String>,
 }
 
+/// Observed state, reported by the kubelet. `observed_generation` echoes the
+/// `metadata.generation` this status reflects — that's how a reader tells
+/// "has the kubelet acted on my latest spec edit yet?"
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PodStatus {
@@ -59,6 +65,10 @@ pub struct PodStatus {
     pub observed_generation: Option<u64>,
 }
 
+/// NOTE: deliberately NO `#[serde(rename_all)]`. K8s phases are PascalCase on
+/// the wire (`"Running"`, not `"running"`); the unit variants already match,
+/// so adding a rename would silently break compatibility. `#[default]` (a
+/// derived-Default enum picks one variant) makes `Pending` the zero value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum PodPhase {
     #[default]
@@ -78,6 +88,13 @@ pub struct ContainerStatus {
     pub state: ContainerStatusState,
 }
 
+/// A data-carrying enum that leans on serde's DEFAULT "externally tagged"
+/// representation to match K8s's container-state wire shape exactly:
+///   - unit variant   → bare string:        `"waiting"`
+///   - struct variant → single-key object:  `{"running": {"startedAt": "..."}}`
+///
+/// `rename_all` lowercases the variant tags; `rename_all_fields` camelCases the
+/// inner fields (`started_at` → `startedAt`). No hand-written (de)serializer.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ContainerStatusState {
@@ -208,6 +225,7 @@ spec:
             resource_version: Some("42".into()),
             generation: Some(3),
             creation_timestamp: Some("2026-05-17T10:00:00Z".into()),
+            ..Default::default()
         };
         let json = serde_json::to_string(&metadata).unwrap();
         assert!(json.contains(r#""resourceVersion":"42""#), "got: {json}");

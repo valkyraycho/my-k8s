@@ -20,6 +20,10 @@ use crate::{
     pod::{Pod, PodStatus},
 };
 
+/// Shared handler state. `Arc<PodStore>` so every handler (and every spawned
+/// watch-stream future) shares ONE store cheaply. `#[derive(Clone)]` is
+/// required: axum clones the state per request, and cloning an `Arc` is just a
+/// refcount bump.
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<PodStore>,
@@ -67,6 +71,9 @@ pub enum ApiError {
     Internal(String),
 }
 
+// `From<StoreError>` lets handlers use `?` on store calls: the storage-layer
+// error auto-converts into the HTTP-layer error. Storage internals (Sled/Json)
+// collapse to a single opaque `Internal` — we don't leak DB details to clients.
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
         match e {
@@ -79,6 +86,10 @@ impl From<StoreError> for ApiError {
     }
 }
 
+// `IntoResponse` is axum's "how do I become an HTTP response?" trait. Because
+// `ApiError` implements it, handlers can return `Result<Response, ApiError>`
+// and axum turns an `Err` into a proper status + JSON `Status` envelope body —
+// the K8s-style machine-readable error shape, keyed on `reason`.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (statue_code, reason) = match &self {
@@ -113,16 +124,25 @@ pub struct RvParams {
     pub resource_version: Option<String>,
 }
 
+/// One endpoint, two behaviors. axum EXTRACTORS in the args do the parsing:
+/// `State` pulls the shared store, `Query` deserializes `?watch=&resourceVersion=`
+/// into `ListWatchParams`. `?watch=true` → a streaming NDJSON body; otherwise →
+/// a one-shot `PodList`.
 pub async fn list_or_watch_pods(
     State(state): State<AppState>,
     Query(params): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
     if params.watch.unwrap_or(false) {
         let from_rv = parse_rv(params.resource_version.as_deref());
+        // Adapt the WatchEvent stream into a byte stream: each event → JSON +
+        // '\n' (NDJSON), which the client line-decodes. `map` transforms each
+        // item; errors become io::Errors that terminate the HTTP body.
         let stream = stream_events(state.store.clone(), from_rv).map(|res| match res {
             Ok(ev) => {
                 let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
                 bytes.push(b'\n');
+                // Turbofish annotates the closure's return type so the compiler
+                // can infer the stream's `Item` (it can't from the bytes alone).
                 Ok::<Vec<u8>, std::io::Error>(bytes)
             }
             Err(e) => {
@@ -130,6 +150,8 @@ pub async fn list_or_watch_pods(
                 Err(std::io::Error::other(e.to_string()))
             }
         });
+        // `Body::from_stream` streams the body incrementally — the response is
+        // open-ended (a watch never "finishes"), so we can't buffer it.
         let response = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
@@ -207,6 +229,8 @@ fn parse_rv(s: Option<&str>) -> u64 {
     s.and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Boundary validation: reject malformed input at the HTTP edge with a 400,
+/// before it ever touches the store. Validate at the boundary, trust the core.
 fn validate_pod(pod: &Pod) -> Result<(), ApiError> {
     if pod.metadata.name.is_empty() {
         return Err(ApiError::BadRequest(

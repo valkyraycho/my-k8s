@@ -8,6 +8,11 @@ use crate::apiserver::handlers::{
     replace_pod_status,
 };
 
+/// The REST surface, in one place. Note `get(...).post(...)` chaining attaches
+/// multiple HTTP methods to one path. `list_or_watch_pods` handles both the
+/// list and the `?watch=true` streaming case (K8s puts them on one endpoint).
+/// `with_state` injects the shared `AppState` (the `Arc<PodStore>`) into every
+/// handler via the `State` extractor — axum's dependency-injection mechanism.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/pods", get(list_or_watch_pods).post(create_pod))

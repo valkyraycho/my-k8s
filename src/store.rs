@@ -1,3 +1,6 @@
+//! The kubelet's in-memory map of live Pods. NOT the persistent store — that's
+//! the apiserver's sled DB. This just tracks what's running on THIS node.
+
 use std::collections::HashMap;
 
 use crate::{
@@ -5,8 +8,9 @@ use crate::{
     runtime::sandbox::PodSandbox,
 };
 
-/// Everything the kubelet knows about one Pod: the desired manifest plus
-/// the live sandbox holding its containers.
+/// Pairs the two sides of reconciliation in one record: the *desired* `pod`
+/// (manifest) and the *actual* `sandbox` (live containers). Reconciling a Pod
+/// is then a local question — compare these two fields.
 pub struct PodState {
     /// The manifest this sandbox was created from.
     pub pod: Pod,
@@ -14,6 +18,11 @@ pub struct PodState {
     pub sandbox: PodSandbox,
 }
 
+/// A thin newtype over `HashMap` (Rust idiom: wrap a collection to expose only
+/// the intent-revealing methods the caller needs, and to have a name to hang
+/// docs/future invariants on). No `Arc<Mutex>` — the reconciler owns this
+/// outright on one task, so there's nothing to synchronize. `#[derive(Default)]`
+/// gives the empty store for free.
 #[derive(Default)]
 pub struct Store {
     pods: HashMap<PodName, PodState>,
@@ -57,6 +66,10 @@ impl Store {
         self.pods.keys().cloned().collect()
     }
 
+    /// Empty the store, yielding OWNED `(name, state)` pairs. Used by graceful
+    /// shutdown, which needs to consume each `PodState` exactly once and call
+    /// `sandbox.destroy()` on it — `drain` moves the values out so there's no
+    /// borrow-vs-move juggling.
     pub fn drain(&mut self) -> Vec<(PodName, PodState)> {
         self.pods.drain().collect()
     }

@@ -54,6 +54,8 @@ impl Client {
         Ok(list.items)
     }
 
+    /// Absence is `Ok(None)`, not an error — a missing Pod is a valid answer,
+    /// so callers `match` on the Option instead of catching a NotFound error.
     pub async fn get_pod(&self, name: &str) -> Result<Option<Pod>> {
         let res = self
             .http
@@ -99,6 +101,12 @@ impl Client {
         Ok(())
     }
 
+    /// Open a watch and decode the NDJSON body into a typed event stream.
+    ///
+    /// Return type `Pin<Box<dyn Stream<...> + Send>>`: the concrete stream is a
+    /// tower of adapter types too unwieldy to name, so we box it into a trait
+    /// object. `Pin` is required because `Stream`s are polled in place and must
+    /// not move; `+ Send` lets the caller poll it from any tokio worker thread.
     pub async fn watch_pods(
         &self,
         from_rv: Option<&str>,
@@ -110,6 +118,12 @@ impl Client {
         let res = self.http.get(&url).send().await?;
         let res = check_status(res).await?;
 
+        // The adapter chain that turns an HTTP byte-stream into typed events —
+        // each link is a standard tokio combinator:
+        //   bytes_stream()            Stream<Result<Bytes>>     raw body chunks
+        //   → StreamReader::new       AsyncRead                 bytes-as-a-reader
+        //   → FramedRead + LinesCodec Stream<Result<String>>    split on '\n'
+        //   → .map(parse)             Stream<Result<WatchEvent>> typed events
         let bytes = res
             .bytes_stream()
             .map(|chunk| chunk.map_err(std::io::Error::other));
@@ -120,6 +134,8 @@ impl Client {
                 line_res.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             Ok(serde_json::from_str(&line)?)
         });
+        // `Box::pin` heap-allocates and pins the stream so it can be returned as
+        // the `dyn Stream` trait object above.
         Ok(Box::pin(events))
     }
 }
@@ -159,6 +175,10 @@ async fn parse_json<T: serde::de::DeserializeOwned>(res: reqwest::Response) -> R
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Translate the server's `Status` envelope back into a typed `ClientError`, so
+/// callers (the reconciler's conflict-retry, mykubectl) match on Rust variants
+/// instead of HTTP codes. Matching on the `(status, reason)` TUPLE distinguishes
+/// the two 409s: `AlreadyExists` (duplicate create) vs `Conflict` (stale rv).
 fn map_envelope(status: StatusCode, env: StatusEnvelope) -> ClientError {
     match (status, env.reason.as_deref()) {
         (StatusCode::NOT_FOUND, _) => ClientError::NotFound,

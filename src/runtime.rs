@@ -34,8 +34,15 @@ pub enum ContainerState {
 
 /// Errors a runtime can return. Variants are matched on by callers, so this
 /// is a real public API surface — keep it small and stable.
+///
+/// Rust idiom — `thiserror`: `#[derive(Error)]` generates the `Display` +
+/// `std::error::Error` impls from the `#[error("...")]` format strings, so we
+/// get a typed, matchable error enum without hand-writing boilerplate. (Use
+/// `thiserror` for *library* errors you match on; `anyhow` for *application*
+/// errors you only propagate.)
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    // `{0:?}` formats the first tuple field with Debug.
     #[error("container {0:?} not found")]
     NotFound(String),
 
@@ -49,11 +56,16 @@ pub enum RuntimeError {
     },
 
     /// Catch-all for runtime-internal failures we don't want to model precisely.
-    /// Use `.into()` on any `anyhow::Error` to land here.
+    /// `#[from]` auto-generates `From<anyhow::Error>`, so `?` on any `anyhow`
+    /// result converts into this variant for free. `{0:#}` prints the full
+    /// anyhow cause chain.
     #[error("runtime error: {0:#}")]
     Other(#[from] anyhow::Error),
 }
 
+/// Rust idiom — crate-local `Result` alias: shadows `std::result::Result` so
+/// every signature in this module can write `Result<T>` and default the error
+/// to `RuntimeError`. Common in modules with one dominant error type.
 pub type Result<T> = std::result::Result<T, RuntimeError>;
 
 /// The contract every container runtime in this project must implement.
@@ -94,9 +106,16 @@ pub trait RuntimeClient {
     /// Walk the runtime's state directory and rebuild in-memory handles for
     /// every container still present on disk. Called on kubelet startup —
     /// closes the Phase 1 gap where a restart lost all sandbox knowledge.
+    ///
+    /// Added to the trait in Phase 2, which means every impl must provide it —
+    /// the real `YoukiRuntime` scans the state dir, the test `MockRuntime`
+    /// just returns an empty `Vec`.
     fn recover_all(&mut self) -> Result<Vec<RecoveredContainer>>;
 }
 
+/// What `recover_all` reports per surviving container: enough for the
+/// reconciler to decide "reattach this sandbox" vs "destroy this orphan".
+/// A plain data struct (no methods) — it's a return value, not a behavior.
 #[derive(Debug, Clone)]
 pub struct RecoveredContainer {
     pub id: String,

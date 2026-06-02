@@ -1,3 +1,7 @@
+//! Persistent Pod storage — our "etcd". A sled (embedded KV) database holding
+//! each Pod as JSON, plus a monotonic resourceVersion counter and a broadcast
+//! channel that fans every write out to watch streams.
+
 use std::path::Path;
 
 use crate::{
@@ -5,6 +9,8 @@ use crate::{
     pod::{Pod, PodStatus},
 };
 use chrono::Utc;
+// `as TxnAbort`: import-rename to shorten the very long `Conflictable...` name
+// at every use site. The two sled error types matter (see `unwrap_txn` below).
 use sled::transaction::{ConflictableTransactionError as TxnAbort, TransactionError};
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -13,8 +19,14 @@ use uuid::Uuid;
 const RV_COUNTER_KEY: &[u8] = b"rv_counter";
 const POD_PREFIX: &str = "pods/";
 const RV_INDEX_TREE: &str = "rv_index";
+/// Broadcast ring-buffer size. A watcher that falls >256 events behind gets
+/// `Lagged` and must re-list (see `watch.rs`). Bigger = more slack, more memory.
 const WATCH_CHANNEL_CAPACITY: usize = 256;
 
+/// `thiserror` enum. `#[from]` on Sled/Json auto-derives `From`, so `?` on a
+/// sled or serde call converts for free. `#[error(transparent)]` forwards the
+/// inner error's `Display` verbatim (no wrapping prefix) — right when this
+/// variant is a pure pass-through of an underlying error.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("not found: {0}")]
@@ -29,6 +41,10 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
 }
 
+/// `db` holds the pods (`pods/<name>` → JSON) and the rv counter; `rv_tree` is
+/// a secondary index (rv → name); `watch_tx` is the broadcast SENDER kept alive
+/// for the store's lifetime so subscribers can attach any time. Holding the
+/// Sender (even with no receivers) keeps the channel open.
 pub struct PodStore {
     db: sled::Db,
     rv_tree: sled::Tree,
@@ -83,6 +99,9 @@ impl PodStore {
     }
 
     pub fn create(&self, mut pod: Pod) -> Result<Pod, StoreError> {
+        // Server MINTS identity and CLOBBERS any client-supplied server fields:
+        // a client can't forge a uid, pin an rv, or pre-seed status. These five
+        // are apiserver-owned, full stop.
         pod.metadata.uid = Some(Uuid::new_v4().to_string());
         pod.metadata.generation = Some(1);
         pod.metadata.creation_timestamp = Some(Utc::now().to_rfc3339());
@@ -92,10 +111,16 @@ impl PodStore {
         let name = pod.metadata.name.clone();
         let key = pod_key(&name);
 
+        // `db.transaction(closure)` runs the closure ATOMICALLY (sled retries it
+        // on contention). The existence check, rv bump, and insert must be one
+        // indivisible unit — else two concurrent creates could both pass the
+        // "doesn't exist" check. The closure returns `Result<_, TxnAbort<_>>`.
         let pod = self
             .db
             .transaction(|tx| {
                 if tx.get(key.as_bytes())?.is_some() {
+                    // `TxnAbort::Abort(e)` aborts WITHOUT retry, carrying our
+                    // typed error out (vs a storage error, which sled may retry).
                     return Err(TxnAbort::Abort(StoreError::AlreadyExists(name.clone())));
                 }
                 let rv = bump_rv(tx)?;
@@ -104,9 +129,13 @@ impl PodStore {
                 tx.insert(key.as_bytes(), to_json(&p)?)?;
                 Ok(p)
             })
+            // `unwrap_txn` collapses sled's two-layer `TransactionError` back
+            // into our flat `StoreError` (see its definition below).
             .map_err(unwrap_txn)?;
 
         self.index_rv(&pod)?;
+        // Fan the write out to all watch subscribers. Done AFTER the txn commits
+        // so watchers never see an event for a write that rolled back.
         emit(&self.watch_tx, WatchEventType::Added, pod.clone());
         Ok(pod)
     }
@@ -230,6 +259,10 @@ fn load_required_pod(
     from_json(&bytes)
 }
 
+/// The optimistic-concurrency gate. The caller must echo back the rv it read;
+/// a mismatch (or a missing rv — a client that forgot to fetch-then-PUT) is a
+/// `Conflict`. `match` with a guard (`Some(p) if p == current_rv`) is the
+/// idiomatic three-way branch: matches, mismatches, absent.
 fn check_rv(current: &Pod, provided: Option<&str>) -> Result<(), TxnAbort<StoreError>> {
     let current_rv = current.metadata.resource_version.as_deref().unwrap_or("");
     match provided {
@@ -244,6 +277,10 @@ fn check_rv(current: &Pod, provided: Option<&str>) -> Result<(), TxnAbort<StoreE
         })),
     }
 }
+/// The single monotonic counter behind every resourceVersion. Read-add-write
+/// INSIDE the transaction so it's atomic with the data write — that's what
+/// makes concurrent writers serialize correctly. `saturating_add` won't wrap
+/// (a u64 counter won't realistically overflow, but no UB if it somehow did).
 fn bump_rv(tx: &sled::transaction::TransactionalTree) -> Result<u64, TxnAbort<StoreError>> {
     let current = tx.get(RV_COUNTER_KEY)?.map(decode_u64).unwrap_or(0);
     let next = current.saturating_add(1);
@@ -251,6 +288,10 @@ fn bump_rv(tx: &sled::transaction::TransactionalTree) -> Result<u64, TxnAbort<St
     Ok(next)
 }
 
+/// Collapse sled's TWO-LAYER transaction error into our flat `StoreError`.
+/// `TransactionError::Abort` = our own typed error returned via `TxnAbort::Abort`;
+/// `Storage` = an underlying sled I/O failure. Callers only want one error type,
+/// so we merge them here with `.map_err(unwrap_txn)`.
 fn unwrap_txn(e: TransactionError<StoreError>) -> StoreError {
     match e {
         TransactionError::Abort(e) => e,

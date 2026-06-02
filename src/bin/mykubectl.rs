@@ -52,6 +52,11 @@ async fn main() -> Result<()> {
     }
 }
 
+/// `apply` is an UPSERT: make the cluster match this file whether or not the
+/// Pod exists. We GET first to branch: if present, copy its current rv onto our
+/// Pod and PUT (the rv is required for the optimistic-concurrency check, and the
+/// YAML file doesn't carry one); if absent, POST. A deliberately simplified
+/// `kubectl apply` — real kubectl does a three-way merge; we just last-writer-wins.
 async fn apply(client: &Client, file: &Path) -> Result<()> {
     let yaml = std::fs::read_to_string(file).with_context(|| format!("reading {file:?}"))?;
     let mut pod = Pod::from_yaml(&yaml).context("parsing pod YAML")?;
@@ -133,6 +138,10 @@ async fn delete(client: &Client, resource: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `kubectl get pods` table. This is the PAYOFF of the §8 status loop: a
+/// process that only talks to the apiserver renders live state the kubelet
+/// reported — READY/RESTARTS come straight from `status.container_statuses`.
+/// `{:<20}` is left-align-in-20-cols formatting for the columns.
 fn print_pod_table(pods: &[Pod]) {
     println!(
         "{:<20} {:<10} {:<8} {:<10} AGE",
@@ -140,6 +149,9 @@ fn print_pod_table(pods: &[Pod]) {
     );
 
     for pod in pods {
+        // Destructure status if present; a Pod with no status yet (just created)
+        // shows 0/total ready. `.filter().count()` and `.map().sum()` are the
+        // idiomatic iterator rollups.
         let (ready, total, restarts) = match &pod.status {
             Some(s) => (
                 s.container_statuses.iter().filter(|c| c.ready).count(),

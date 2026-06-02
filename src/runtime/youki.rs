@@ -1,3 +1,7 @@
+//! The real [`RuntimeClient`] impl: a thin adapter over youki's `libcontainer`.
+//! This is the ONLY module that touches libcontainer — everything above the
+//! trait stays runtime-agnostic (and test-mockable).
+
 use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::Context;
@@ -12,6 +16,10 @@ use crate::runtime::RecoveredContainer;
 
 use super::{ContainerState, Result, RuntimeClient, RuntimeError};
 
+/// `state_dir` is the on-disk half (libcontainer's `--root`, where per-container
+/// `state.json` lives); the `HashMap` is the in-memory half — the live
+/// `Container` handles, which hold open fds and aren't cheap to rebuild. We
+/// cache them so every call after `create` is a map lookup, not a reload.
 pub struct YoukiRuntime {
     state_dir: PathBuf,
     containers: HashMap<String, Container>,
@@ -59,6 +67,10 @@ impl RuntimeClient for YoukiRuntime {
             .containers
             .get_mut(id)
             .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
+        // Boundary conversion: the trait takes a raw `i32` so callers can pass
+        // `libc::SIGTERM` without depending on `nix`; libcontainer wants a typed
+        // `nix::Signal`. `TryFrom` is the fallible-conversion idiom (an invalid
+        // signal number is an error, not a panic).
         let sig =
             Signal::try_from(signal).with_context(|| format!("invalid signal number {signal}"))?;
         container.kill(sig, false).context("Container::kill")?;
@@ -75,15 +87,23 @@ impl RuntimeClient for YoukiRuntime {
     }
 
     fn container_state(&mut self, id: &str) -> Result<ContainerState> {
+        // Unknown id is a valid answer (NotFound), not an error — so the
+        // reconciler's liveness check can treat "gone" as "needs restart".
         let container = match self.containers.get_mut(id) {
             Some(c) => c,
             None => return Ok(ContainerState::NotFound),
         };
 
+        // `refresh_status()` re-reads /proc — cheap, but not free; this is the
+        // polling primitive liveness reconciliation calls once per tick.
         container
             .refresh_status()
             .context("Container::refresh_status")?;
 
+        // Flatten libcontainer's 5 statuses into our 4: the orchestrator never
+        // pauses, and Creating/Created are a transient distinction it ignores.
+        // An exhaustive match (no `_` arm) means a new libcontainer status would
+        // force a compile error here — deliberate, so we can't silently mishandle.
         Ok(match container.status() {
             ContainerStatus::Created | ContainerStatus::Creating => ContainerState::Created,
             ContainerStatus::Running | ContainerStatus::Paused => ContainerState::Running,
@@ -99,8 +119,13 @@ impl RuntimeClient for YoukiRuntime {
         Ok(container.pid().map(|p| p.as_raw() as u32))
     }
 
+    /// Rebuild handles from libcontainer's on-disk state after a kubelet
+    /// restart. `Container::load(dir)` reconstructs a handle from the
+    /// `state.json` the kernel-side bookkeeping left behind — that's what lets
+    /// us re-adopt still-running containers instead of orphaning them.
     fn recover_all(&mut self) -> Result<Vec<RecoveredContainer>> {
         let mut recovered = Vec::new();
+        // No state dir yet (first boot) → nothing to recover, not an error.
         if !self.state_dir.exists() {
             return Ok(recovered);
         }

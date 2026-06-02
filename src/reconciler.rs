@@ -48,6 +48,13 @@ struct RestartTracker {
     next_retry_at: Instant,
 }
 
+/// The kubelet's brain. Generic over `R: RuntimeClient` (static dispatch) so
+/// the real `YoukiRuntime` and the test `MockRuntime` exercise the SAME logic.
+///
+/// Two maps that look similar but differ: `cache` is desired state (mirrors the
+/// apiserver, fed by watch/resync); `store` is actual state (live sandboxes).
+/// `restart_state` tracks CrashLoopBackOff; `last_pushed_status` dedups status
+/// PUTs so we only report on change, not every tick.
 pub struct Reconciler<R: RuntimeClient> {
     client: Arc<Client>,
     pods_dir: PathBuf,
@@ -81,6 +88,8 @@ impl<R: RuntimeClient> Reconciler<R> {
         }
     }
 
+    /// The informer loop. Takes `mut self` by value (it runs until shutdown,
+    /// then drops everything), driven by three independent clocks plus cancel.
     pub async fn run(mut self, cancel: CancellationToken) -> Result<()> {
         info!("reconciler starting");
 
@@ -95,6 +104,9 @@ impl<R: RuntimeClient> Reconciler<R> {
             .await
             .context("opening watch stream")?;
 
+        // First `.tick()` on a tokio interval fires IMMEDIATELY; we await-and-
+        // discard it here so the real loop doesn't do a resync + liveness pass
+        // the instant it starts (we just did startup()).
         let mut liveness_interval = tokio::time::interval(LIVENESS_INTERVAL);
         let mut resync_interval = tokio::time::interval(RESYNC_INTERVAL);
         resync_interval.tick().await;
@@ -103,10 +115,19 @@ impl<R: RuntimeClient> Reconciler<R> {
         info!("reconciler entered steady state");
 
         loop {
+            // `select!` races all arms; `biased` makes it check them top-to-
+            // bottom in order instead of randomly — so cancel always wins over
+            // doing one more tick. The three concerns are deliberately separate
+            // clocks: watch = react to spec changes fast; resync = correctness
+            // backstop; liveness = container health.
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
+                // `.next()` on the watch Stream yields Option<Result<Event>>.
                 event = watch_stream.next() => match event {
+                    // `block_in_place`: apply_watch_event does sync libcontainer
+                    // work; this tells tokio "this worker thread is going
+                    // blocking, move other tasks off it" (multi_thread runtime only).
                     Some(Ok(event)) => block_in_place(|| self.apply_watch_event(event)),
                     Some(Err(e)) => warn!(error = ?e, "watch stream error; resync will resseed"),
                     None => warn!("watch stream closed; resync will reseed"),
@@ -117,6 +138,10 @@ impl<R: RuntimeClient> Reconciler<R> {
                       }
                   }
                   _ = liveness_interval.tick() => {
+                    // Sync/async split: compute the dirty set under block_in_place
+                    // (blocking runtime calls), then `.await` the HTTP status
+                    // pushes OUTSIDE it — you must never `.await` inside
+                    // block_in_place.
                     let dirty = block_in_place(|| self.tick_liveness());
                     for (name, status) in dirty {
                         if let Err(e) = self.push_status(&name, &status).await {
@@ -241,20 +266,32 @@ impl<R: RuntimeClient> Reconciler<R> {
         Ok(())
     }
 
+    /// Runs every 2s. Returns the *dirty set* — Pods whose freshly-computed
+    /// status differs from what we last pushed — so the caller only PUTs
+    /// changes (level-triggered reporting), not an identical status every tick.
     fn tick_liveness(&mut self) -> Vec<(PodName, PodStatus)> {
+        // Collect names up front: we iterate while `reconcile_liveness` mutably
+        // borrows `self`, so we can't hold an iterator into `self.cache`.
         let names = self.cache.keys().cloned().collect::<Vec<PodName>>();
         let mut dirty: Vec<(PodName, PodStatus)> = Vec::new();
 
         for name in names {
+            // let-else: bind `pod` or bail this iteration. Cleaner than
+            // `match { Some => .., None => continue }`.
             let Some(pod) = self.cache.get(&name).cloned() else {
                 continue;
             };
 
+            // `.entered()` attaches this span to the current thread for the
+            // rest of the scope, so every log inside is tagged `pod=<name>`.
             let _span = info_span!("liveness", pod = %name).entered();
             if let Err(e) = self.reconcile_liveness(&name, &pod) {
                 error!(error = ?e, "liveness failed");
             }
 
+            // The dedup check. `Some(&&new_status)`: `.get()` gives
+            // `Option<&PodStatus>`, `.as_ref()` makes it `Option<&&PodStatus>`,
+            // so we compare against a `&&`. Differs (or absent) → dirty.
             let new_status = self.compute_pod_status(&pod);
             if self.last_pushed_status.get(&name).as_ref() != Some(&&new_status) {
                 dirty.push((name.clone(), new_status));
@@ -270,11 +307,17 @@ impl<R: RuntimeClient> Reconciler<R> {
         dirty
     }
 
+    /// Roll the live container states up into one Pod `PodStatus`. The phase
+    /// precedence (below) mirrors real K8s: "not fully up" dominates "up".
     fn compute_pod_status(&mut self, pod: &Pod) -> PodStatus {
         let name = &pod.metadata.name;
+        // `with_capacity`: we know exactly how many we'll push — one alloc, no
+        // re-growth. A small but idiomatic perf habit when the size is known.
         let mut container_statuses = Vec::with_capacity(pod.spec.containers.len());
         let mut any_waiting = false;
         let mut any_running = false;
+        // Starts true ONLY if there are containers; an empty Pod isn't "all
+        // terminated". Each non-Stopped container flips it false below.
         let mut all_terminated = !pod.spec.containers.is_empty();
 
         for c in &pod.spec.containers {
@@ -305,6 +348,8 @@ impl<R: RuntimeClient> Reconciler<R> {
                     all_terminated = false;
                     (ContainerStatusState::Waiting, false)
                 }
+                // Placeholders: we don't yet capture real exit codes (always 0)
+                // or start timestamps ("unknown" above). Honest Phase 2 shortcuts.
                 ContainerState::Stopped => {
                     (ContainerStatusState::Terminated { exit_code: 0 }, false)
                 }
@@ -318,6 +363,8 @@ impl<R: RuntimeClient> Reconciler<R> {
             });
         }
 
+        // Precedence ORDER matters: a Pod with one container still coming up is
+        // Pending even if a sibling is already Running. Checked waiting-first.
         let phase = if any_waiting {
             PodPhase::Pending
         } else if all_terminated {
@@ -422,13 +469,20 @@ impl<R: RuntimeClient> Reconciler<R> {
     }
 
     fn reconcile_liveness(&mut self, name: &str, pod: &Pod) -> Result<()> {
-        // Disjoint borrows: we need &mut for store, runtime, AND restart_state.
+        // Rust idiom — DISJOINT BORROWS via destructuring. We need `&mut` on
+        // three fields at once (store, runtime, restart_state). Calling
+        // `self.store.get_mut()` then `self.runtime...` would fail: the first
+        // borrows all of `*self`. Destructuring `let Self { .. } = self` splits
+        // it into three independent field borrows the checker accepts. `..`
+        // ignores the fields we don't touch here.
         let Self {
             store,
             runtime,
             restart_state,
             ..
         } = self;
+        // Pod might have been removed between cache read and here — `None` is
+        // fine, just nothing to reconcile.
         let state = match store.get_mut(name) {
             Some(s) => s,
             None => return Ok(()),
@@ -442,6 +496,9 @@ impl<R: RuntimeClient> Reconciler<R> {
 
             match s {
                 ContainerState::Stopped | ContainerState::NotFound => {
+                    // `entry(...).or_insert_with(...)`: get the tracker, or
+                    // create one on first crash — the canonical "upsert into a
+                    // map" idiom, one lookup instead of contains+insert.
                     let tracker = restart_state
                         .entry(container_id.clone())
                         .or_insert_with(|| RestartTracker {
@@ -556,7 +613,14 @@ impl<R: RuntimeClient> Reconciler<R> {
         Ok(())
     }
 
+    /// Write observed status to the apiserver, optimistic-concurrency style.
+    /// The cached rv goes stale whenever the apiserver advances it (a spec edit,
+    /// or our own resync), so a Conflict is EXPECTED, not exceptional — we
+    /// refetch the fresh rv and retry ONCE. A single retry (not a loop) avoids
+    /// livelock against a hot-edited Pod; the 2s tick provides natural backoff.
     async fn push_status(&mut self, name: &PodName, status: &PodStatus) -> Result<()> {
+        // `and_then` chains the Options: no cached pod OR no rv yet → skip
+        // (nothing to write against). Flattens two `Option` layers cleanly.
         let rv = match self
             .cache
             .get(name)
@@ -566,8 +630,12 @@ impl<R: RuntimeClient> Reconciler<R> {
             None => return Ok(()),
         };
 
+        // Match on the specific error VARIANT: only Conflict triggers the
+        // refetch-retry; any other error propagates.
         match self.client.replace_pod_status(name, status, &rv).await {
             Ok(updated) => {
+                // Server echoes back the pod with its NEW rv — refresh the cache
+                // so the next push uses an up-to-date version.
                 self.cache.insert(name.clone(), updated);
                 self.last_pushed_status.insert(name.clone(), status.clone());
                 Ok(())
@@ -604,9 +672,13 @@ impl<R: RuntimeClient> Reconciler<R> {
 
 /// Exponential backoff: BASE * 2^(n-1), capped at MAX.
 /// n=1 → BASE, n=2 → 2*BASE, ... until we hit the cap.
+///
+/// Note the defensive integer math — overflow here would be a real bug:
+/// `saturating_sub` (n−1 won't underflow at n=0), `.min(20)` caps the shift
+/// (`1 << 64` is UB-adjacent; `checked_shl` returns None past the width, and
+/// `.unwrap_or(u64::MAX)` saturates), `saturating_mul` clamps instead of
+/// wrapping. The final `.min(BACKOFF_MAX)` enforces the cap.
 fn compute_backoff(restart_count: u32) -> Duration {
-    // Cap the exponent so the shift doesn't overflow. After ~20 doublings
-    // we'd hit BACKOFF_MAX anyway.
     let exp = restart_count.saturating_sub(1).min(20);
     let multiplier = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
     let base_micros = BACKOFF_BASE.as_micros() as u64;

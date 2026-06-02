@@ -30,8 +30,8 @@
 |---|-------|-------------|
 | 0 | Dev env + scaffold | `cargo run --bin scratch` runs busybox container ✅ |
 | 1 | Single-node "mini-kubelet" — the **Pod sandbox** primitive | `mykubelet` watches a manifests dir, runs multi-container Pods ✅ |
-| 2 | API server v1 | kubelet talks to API server over HTTP; multiple kubelets possible ⬅ **in progress** |
-| 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it |
+| 2 | API server v1 | kubelet talks to API server over HTTP; multiple kubelets possible ✅ |
+| 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it ⬅ **next** |
 | 4 | Scheduler | Pods distributed across 2+ kubelets |
 | 5 | Services & networking | `curl` a Service VIP, traffic load-balances |
 | 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC |
@@ -66,11 +66,21 @@ Phase 6 explicitly **dropped** "write your own runtime" — already done that in
 - *Hand-roll `clone(2)` + `pivot_root` + cgroup setup*: already learned in the prior Docker project — would be repeating ourselves.
 - *libcontainer*: in-process Rust crate exposing the same operations as runc. Keeps the runtime layer "library-thin" so interesting code lives in our orchestrator.
 
-**Key facts learned for Phase 1:**
-- The working construction is `ContainerBuilder::new(id, syscall).with_root_path(state).with_executor(DefaultExecutor{}).as_init(bundle).with_systemd(false).build()`.
-- `Container` has `start()`, `refresh_status()`, `status()`, `delete(force)`, `pid()` — but **no `wait()`**. We poll `refresh_status()` to detect crashes.
-- `oci_spec::runtime::LinuxNamespace` has an optional `path` field — `None` = create new namespace, `Some("/proc/PID/ns/X")` = join existing. **This is the API we'll use for the pause-container pattern.**
-- Root is required for namespace creation. Kubelet runs as root, like real K8s.
+**The working libcontainer construction** (it survives almost verbatim into `youki.rs::create_container`):
+```rust
+let container = ContainerBuilder::new(id, SyscallType::default()) // ① builder pattern
+    .with_root_path(state_dir)?     // ② where libcontainer keeps per-container state.json
+    .with_executor(DefaultExecutor {})
+    .as_init(bundle_path)           // ③ this bundle dir holds config.json + rootfs
+    .with_systemd(false)            // ④ cgroupfs driver, not systemd (we manage cgroups directly)
+    .build()?;                      // ⑤ each builder step can fail → Result, hence `?`
+```
+> **① `ContainerBuilder`** is `derive_builder`-style: chained setters then `.build()`. **②** `with_root_path` is libcontainer's `--root` equivalent — the on-disk state dir. **⑤** the whole chain is fallible, so the smoke test was also where we learned every builder call wants `?`.
+
+**Key facts that shaped Phase 1:**
+- `Container` exposes `start()`, `refresh_status()`, `status()`, `delete(force)`, `pid()` — but **no `wait()`**. No blocking wait means we *poll* `refresh_status()` to detect crashes (→ the 2s liveness tick).
+- `oci_spec::runtime::LinuxNamespace` has an optional `path` field — `None` = create a new namespace, `Some("/proc/PID/ns/X")` = join an existing one. **This single `Option` is the entire pause-container mechanism** (§5/§7).
+- Root is required for namespace creation. The kubelet runs as root, like real K8s.
 
 ## Devcontainer wrap
 
@@ -187,16 +197,21 @@ spec:                              spec: PodSpec {
 ```
 Anything above the line never imports libcontainer. That's what lets the *exact same* reconciler logic run against the real runtime in the VM and against a mock in a unit test.
 
-**Did:** A six-method trait on `&mut self`. Each method maps to one step of a container's life:
+**Did — the actual trait** (`src/runtime.rs`):
+```rust
+pub trait RuntimeClient {
+    fn create_container(&mut self, id: &str, bundle_path: &Path) -> Result<()>; // build, don't run
+    fn start_container(&mut self, id: &str) -> Result<()>;                       // run init proc
+    fn kill_container(&mut self, id: &str, signal: i32) -> Result<()>;           // SIGTERM/SIGKILL
+    fn delete_container(&mut self, id: &str, force: bool) -> Result<()>;         // free state
+    fn container_state(&mut self, id: &str) -> Result<ContainerState>;           // POLL this
+    fn container_pid(&mut self, id: &str) -> Result<Option<u32>>;                // ① for §7
+    fn recover_all(&mut self) -> Result<Vec<RecoveredContainer>>;                // ② Phase 2
+}
 ```
-create_container(id, bundle)   build it from an OCI bundle, don't run yet
-start_container(id)            run the init process
-container_state(id) -> State   "is it Created / Running / Stopped / NotFound?"  (poll this)
-container_pid(id)   -> Option  the init PID — needed so others can join its namespaces (§7)
-kill_container(id, signal)     send SIGTERM / SIGKILL
-delete_container(id, force)    remove runtime state (force = kill first)
-```
-Plus a `RuntimeError` enum (`NotFound`, `AlreadyExists`, `InvalidBundle`, `Other`-from-anyhow) and a flattened `ContainerState` enum (`Created`, `Running`, `Stopped`, `NotFound`).
+> **`&mut self` everywhere** (see Decision below) — the honest constraint, surfaced not hidden. **`Result<T>`** is a crate-local alias defaulting the error to `RuntimeError`, so signatures stay terse. **①** `container_pid` looks odd on a generic runtime API; it exists *only* so the sandbox can read the pause PID for `/proc/{pid}/ns/net`. **②** `recover_all` was added in Phase 2 — adding a trait method forces every impl (real + mock) to provide it.
+
+`RuntimeError` is a `thiserror` enum (`NotFound`, `AlreadyExists`, `InvalidBundle`, `Other` via `#[from] anyhow::Error`); `ContainerState` flattens libcontainer's five statuses into four (`Created`/`Running`/`Stopped`/`NotFound`).
 
 **Why a trait when there's only one real impl.** Two reasons, both load-bearing:
 1. **Testability.** Everything above the seam is tested with `MockRuntime`, which just appends each call to a `Vec<String>`. No root, no libcontainer, no OCI bundle. The reconciler's whole behavior (restart logic, backoff, teardown ordering) is verified by asserting on that recorded call list (§12). Without the seam, every test would need a real Linux VM.
@@ -278,7 +293,22 @@ A trimmed `config.json` for an app container looks like:
 | **IPC** | **joins pause** | shared `/dev/shm`, SysV IPC between containers in the Pod |
 | **UTS** | **joins pause** | shared hostname |
 
-This is *exactly* what real K8s does. The `share_namespaces_from_pid` argument is `None` for the pause container (it creates all five fresh) and `Some(pause_pid)` for every app container (it joins the three shared ones). The four tests in `bundle.rs::tests` pin this contract down — e.g. `app_container_keeps_pid_and_mount_per_container` asserts those two stay `path: None`.
+This is *exactly* what real K8s does. And it's startlingly little code — the entire pause-vs-app distinction is one `if let Some`:
+```rust
+// per-container: PID + mount always get a FRESH namespace (never a path)
+for ty in [LinuxNamespaceType::Pid, LinuxNamespaceType::Mount] {
+    namespaces.push(LinuxNamespaceBuilder::default().typ(ty).build()?);
+}
+// shared-from-pause: net/ipc/uts get a path ONLY when we were given a pid
+for (ty, ns_name) in [(Network, "net"), (Ipc, "ipc"), (Uts, "uts")] {
+    let mut b = LinuxNamespaceBuilder::default().typ(ty);
+    if let Some(pid) = share_namespaces_from_pid {          // ← the whole mechanism
+        b = b.path(PathBuf::from(format!("/proc/{pid}/ns/{ns_name}")));
+    }
+    namespaces.push(b.build()?);
+}
+```
+> `share_namespaces_from_pid` is `None` for the pause (all five fresh) and `Some(pause_pid)` for app containers (the three shared ones get a `path`, so libcontainer `setns`es into them). `if let Some` is the idiomatic "set this only when present" — no null, no unwrap. The four `bundle.rs::tests` pin the contract — e.g. `app_container_keeps_pid_and_mount_per_container` asserts PID/mount stay `path: None`.
 
 **Decision — every container gets a hardened, runc-like baseline.** `terminal: false`, `no_new_privileges: true`, uid/gid 0 (root inside, the K8s default), `PATH=/bin`, `HOME=/`, `cwd=/`; mounts for `/proc`, `/dev` (tmpfs 64K), `/sys` (ro), `/tmp` (tmpfs 16M, sticky). These are the "forget one and something breaks weirdly" defaults — copied from what `runc spec` generates, because reinventing them by trial-and-error is pure pain.
 
@@ -354,13 +384,28 @@ Because the namespace's lifetime is tied to the *pause* PID, not the app PID, th
 
 **Concept — what "join a namespace" means at the syscall level.** When the OCI config says `{"type":"network","path":"/proc/4242/ns/net"}`, libcontainer opens that file and calls `setns(2)` on it before `exec`-ing the container's process. `/proc/PID/ns/net` is a kernel-provided magic handle representing PID 4242's network namespace; `setns` moves the calling process into it. A namespace stays alive as long as *something* references it — the pause process is that something. Kill the last referencer and the kernel tears the namespace down.
 
-**Did:** A `PodSandbox` owning one Pod's lifecycle:
+**Did:** A `PodSandbox` owning one Pod's lifecycle — `create` (build+run pause, capture pid, bring `lo` up), `add_container` (join the pause), `remove_container`, `destroy`. The graceful-termination ladder in `remove_container` shows several idioms at once:
+```rust
+match runtime.kill_container(&id, libc::SIGTERM) {
+    Ok(()) => {
+        let deadline = Instant::now() + TERMINATION_GRACE;   // 5s
+        while Instant::now() < deadline {
+            let s = runtime.container_state(&id)?;
+            if matches!(s, ContainerState::Stopped | ContainerState::NotFound) { break; }
+            std::thread::sleep(POLLING_INTERVAL);             // ① sync sleep — see note
+        }
+    }
+    Err(e) => warn!(?e, "SIGTERM failed; proceeding to delete"), // ② not fatal: fall through
+}
+match runtime.delete_container(&id, true) {
+    Ok(()) | Err(RuntimeError::NotFound(_)) => {}             // ③ or-pattern → idempotent
+    Err(e) => return Err(e).context(format!("delete container {name}")),
+}
+let _ = std::fs::remove_dir_all(&bundle_dir);                // ④ best-effort, discard Result
 ```
-   create(runtime)          build+run pause; capture pause_pid; bring lo up (see below)
-   add_container(rt, c)     build c's bundle with share_from_pid=Some(pause_pid); run it
-   remove_container(rt, n)  SIGTERM → poll ≤5s for Stopped → delete(force=true) → rm bundle
-   destroy(rt)              remove ALL app containers, THEN delete pause, THEN rm pod dir
-```
+> **①** a blocking `thread::sleep` is fine because the reconciler runs this inside `block_in_place`. **②** SIGTERM failing (already-gone) isn't fatal — delete is what actually frees state. **③** treating "deleted" and "already NotFound" the same makes delete idempotent (an or-pattern in one match arm). **④** `let _ =` deliberately discards a Result we don't care about — a leftover dir is harmless.
+
+And `destroy` tears down in **reverse dependency order** — all app containers first, pause last — so an app never loses its shared netns mid-cleanup (pinned by `destroy_removes_app_containers_before_pause`).
 
 **Decision — pause runs `/bin/busybox sleep infinity`.** Real K8s ships a purpose-built `pause` binary that ignores signals and reaps zombie processes. Ours just needs to hold namespaces and stay alive, which `sleep infinity` does. Good enough for Phase 1; the zombie-reaping nicety can come later if we ever share the PID namespace.
 
@@ -476,7 +521,17 @@ Two properties fall out of this shape for free:
 
 **Decision — `block_in_place` for the sync work** (`reconciler.rs:86, 94`). libcontainer calls are sync (multi-millisecond, potentially much longer). Calling them directly inside an async task would block the tokio scheduler thread, hurting any other tasks on the runtime. `block_in_place` tells tokio "this thread is going sync for a while — move other tasks off it." It's a `multi_thread` runtime feature; on a current-thread runtime this would deadlock.
 
-**Decision — disjoint mutable borrows via destructuring** (`reconciler.rs:179-184`). Inside `reconcile_liveness`, we need `&mut` on three fields of `self` simultaneously: `store`, `runtime`, `restart_state`. A naive `self.store.get_mut(...)` then `self.runtime.container_state(...)` would error — `self` is already borrowed mutably. Destructuring `let Self { store, runtime, restart_state, .. } = self;` splits the borrow into three independent ones. This is a real production pattern, not a hack.
+**Decision — disjoint mutable borrows via destructuring.** Inside `reconcile_liveness` we need `&mut` on three fields of `self` *at once*. The naive form fails the borrow checker; destructuring fixes it:
+```rust
+// ✗ self.store.get_mut(name) borrows ALL of *self mutably; the later
+//   self.runtime / self.restart_state uses then conflict.
+let Self { store, runtime, restart_state, .. } = self;  // ✓ three INDEPENDENT field borrows
+let state = match store.get_mut(name) { Some(s) => s, None => return Ok(()) };
+// now `store`, `runtime`, `restart_state` are usable together:
+let s = runtime.container_state(&id)?;
+let tracker = restart_state.entry(id.clone()).or_insert_with(/* ... */); // upsert idiom
+```
+> The borrow checker tracks borrows per-field once you *name* the fields via `let Self { .. } = self`, but can't see through a method call like `self.store.get_mut()` (which borrows the whole `self`). This destructure is the idiomatic fix — a real production pattern, not a workaround. `..` ignores the fields this function doesn't touch.
 
 **Gotcha — restart_state grows unboundedly without explicit cleanup.** When a pod is removed (`remove_pod`), we explicitly delete the tracker entries for its containers (`reconciler.rs:168-171`). Otherwise the map would grow forever across pod churn. The test `remove_pod_clears_restart_trackers` pins this down.
 
@@ -624,9 +679,9 @@ This is *the* move that makes K8s K8s: once desired state lives behind an API wi
 
 **New crates:** `axum` (HTTP server), `sled` (embedded KV store — our stand-in for etcd), `reqwest` (HTTP client), `uuid` + `chrono` (identity + timestamps), `tokio-stream` / `async-stream` (the watch stream), `tower` (dev-dep, for testing axum handlers via `oneshot`).
 
-**Status as of this writing.** The full vertical slice now compiles and tests green: library, `apiserver` binary, `Client`, and the migrated `kubelet` binary. `cargo check --all-targets` is clean. The kubelet reads desired state from the apiserver (informer loop, §7) *and* reports observed state back (status loop, §8). `src/watcher.rs` is gone — the apiserver replaces the directory watch. What's left for a full Phase 2 demo is an end-to-end run in the VM (apiserver + kubelet + `curl`-driven Pod create → container runs → status reported), plus a `mykubectl` client; the pieces are wired but the live multi-process demo hasn't been recorded here yet.
+**Phase 2 is shipped.** ✅ The full vertical slice compiles, passes **76 tests**, and was **verified live end-to-end on the VM** (§10): `apiserver` (axum + sled) ← HTTP → `kubelet` (informer-style client) plus a `mykubectl` CLI. `cargo check --all-targets` clean. The kubelet reads desired state from the apiserver (informer loop, §7) *and* reports observed state back (status loop, §8); `mykubectl` (§9) drives the whole thing from the command line. `src/watcher.rs` is gone — the apiserver replaces the directory watch.
 
-The order below mirrors the dependency order: wire types → storage → watch → HTTP surface → server bin → client → the kubelet's informer loop → the kubelet's status loop.
+The order below mirrors the dependency order: wire types → storage → watch → HTTP surface → server bin → client → the kubelet's informer loop → the kubelet's status loop → the `mykubectl` CLI → the end-to-end demo.
 
 ## 1. Wire format — Pod gains status + apiserver metadata (`src/pod.rs`)
 
@@ -678,7 +733,20 @@ This is our **etcd**. The single most important Phase 2 concept lives here.
 ```
 This is lost-update prevention *without locks*: a read-modify-write that fails loudly instead of silently clobbering. Real K8s does exactly this; the rv is opaque to clients (they just echo it back).
 
-**Concept — the atomic transaction.** The rv-check and the counter-bump must happen as one indivisible step, or two concurrent writers could both pass the check before either bumps. `sled`'s `transaction()` gives us that: inside the closure we `load_required_pod` → `check_rv` → `bump_rv` → `insert`, all-or-nothing. The `ConflictableTransactionError::Abort` path carries our typed `StoreError` (e.g. `Conflict`, `AlreadyExists`) back out; `unwrap_txn` unwraps it.
+**Concept — the atomic transaction, in code.** The rv-check and counter-bump must be one indivisible step, or two writers could both pass the check before either bumps. `sled`'s `transaction(closure)` gives that (`replace_spec`):
+```rust
+let updated = self.db.transaction(|tx| {
+    let current = load_required_pod(tx, &key, name)?;   // ① read
+    check_rv(&current, provided_rv.as_deref())?;        // ② guard: stale rv → Abort(Conflict)
+    let rv = bump_rv(tx)?;                               // ③ bump the global counter
+    let mut p = new_pod.clone();
+    p.metadata.resource_version = Some(rv.to_string());
+    tx.insert(key.as_bytes(), to_json(&p)?)?;           // ④ write — all inside one txn
+    Ok(p)
+}).map_err(unwrap_txn)?;                                 // ⑤ flatten the 2-layer error
+emit(&self.watch_tx, WatchEventType::Modified, updated.clone()); // ⑥ fan out AFTER commit
+```
+> **Rust idiom — two-layer transaction error.** Inside the closure, `?`/`Abort` produce `ConflictableTransactionError<StoreError>`; sled wraps that as `TransactionError<StoreError>` (our `Abort` vs sled's `Storage` I/O error). `unwrap_txn` collapses both back into one flat `StoreError` so callers see a single error type. **⑥** the watch event is emitted only after the txn commits, so watchers never see a rolled-back write.
 
 **Concept — create mints identity and *clobbers* client-supplied server fields.** On `create`, the store overwrites `uid` (fresh UUID), `generation` (=1), `creationTimestamp` (=now), `resourceVersion` (minted), and discards any client-sent `status`. Why: those fields are server-owned. A client must not be able to forge a uid, pin an rv, or pre-seed status. Pinned by `create_clobbers_client_provided_apiserver_fields`.
 
@@ -712,6 +780,28 @@ The watch is what makes K8s **reactive** instead of poll-based. Heavy.
                           the rv boundary dedupes the handoff:
               nothing is emitted twice, nothing between the phases is lost
 ```
+The whole thing is one generator (`src/apiserver/watch.rs`):
+```rust
+pub fn stream_events(store: Arc<PodStore>, from_rv: u64)
+    -> impl Stream<Item = Result<WatchEvent, WatchError>>     // ① opaque return type
+{
+    try_stream! {                                             // ② generator macro
+        let mut rx = store.subscribe();                       // ③ subscribe BEFORE snapshot
+        let (snapshot, snapshot_rv) = store.list()?;
+        for pod in snapshot {                                 // catch-up
+            if pod_rv(&pod) > from_rv { yield added(pod) }
+        }
+        loop {                                                // live
+            match rx.recv().await {
+                Ok(ev) => if pod_rv(&ev.object) > snapshot_rv { yield ev },
+                Err(RecvError::Lagged(n)) => Err(WatchError::Lagged(n))?, // ④ `?` ENDS the stream
+                Err(RecvError::Closed) => break,
+            }
+        }
+    }
+}
+```
+> **①** `impl Stream` — `try_stream!`'s concrete type is unnameable, so return an opaque `impl Trait`. **②** write the stream as straight-line async with `yield` instead of a hand-rolled `poll_next`. **③** subscribing first means a write between subscribe and `list()` is buffered, not lost. **④** inside `try_stream!`, `?` on an `Err` *yields it as the final item and terminates the stream* — that's how a `Lagged` receiver becomes a clean close → HTTP 410 → client re-lists.
 
 **Gotcha — subscribe BEFORE snapshotting (the correctness lynchpin).** The code does `store.subscribe()` *then* `store.list()`. Reverse that order and a write landing between list and subscribe would vanish — absent from the snapshot, and not yet subscribed. Subscribing first means any such write is buffered in the broadcast channel and replayed in the live phase; the `rv > snapshot_rv` filter discards it only if the snapshot already contained it. This subscribe-then-list ordering is the classic watch-cache argument, and `live_events_after_catch_up_are_delivered` exercises it.
 
@@ -794,6 +884,26 @@ The kubelet's brain, rebuilt around the apiserver. Heavy.
    │ liveness_interval (2s)  → tick_liveness()       restart crashed      │
    └────────────────────────────────────────────────────────────────────┘
 ```
+In code, the loop is a single `select!` over the four arms:
+```rust
+loop {
+    tokio::select! {
+        biased;                                          // ① check arms top-down, not random
+        _ = cancel.cancelled() => break,                 //    so cancel beats a pending tick
+        event = watch_stream.next() => match event {
+            Some(Ok(ev)) => block_in_place(|| self.apply_watch_event(ev)), // ② sync work
+            Some(Err(e)) => warn!(?e, "watch error; resync will reseed"),
+            None => warn!("watch closed; resync will reseed"),
+        },
+        _ = resync_interval.tick() => { self.resync().await?; }
+        _ = liveness_interval.tick() => {
+            let dirty = block_in_place(|| self.tick_liveness());  // ③ compute sync...
+            for (name, status) in dirty { self.push_status(&name, &status).await; } // ...push async
+        },
+    }
+}
+```
+> **①** `biased` makes `select!` poll arms in written order instead of randomly, so cancel always wins over doing one more tick. **②/③** the sync/async boundary: libcontainer work runs in `block_in_place` (tells tokio "this thread is going blocking, move other tasks off it"), but the HTTP `push_status` is `.await`ed *outside* it — you must never `.await` inside `block_in_place`.
 
 **Concept — three clocks, three concerns.** The power of the informer shape is separating these:
 - **watch** — react to *desired-state* changes with near-zero latency (a Pod was created/modified/deleted in the apiserver).
@@ -861,16 +971,26 @@ Order matters: a Pod with one container still starting is `Pending` *even if* a 
 ```
 This is *level-triggered* reporting: push on **change**, not on schedule. Same instinct as the reconcile loop itself (act on the diff, not the clock). Pinned by `tick_liveness_marks_dirty_then_dedups_after_push`.
 
-**Concept — `push_status`: optimistic concurrency from the client side.** The `/status` endpoint requires `?resourceVersion=` (§4), so a status write is a read-modify-write against the version the kubelet last saw:
+**Concept — `push_status`: optimistic concurrency from the client side.** The `/status` endpoint requires `?resourceVersion=` (§4), so a status write is a read-modify-write against the version the kubelet last saw. Matching on the specific error *variant* drives the retry:
+```rust
+match self.client.replace_pod_status(name, status, &rv).await {
+    Ok(updated) => {                              // server echoes the NEW rv
+        self.cache.insert(name.clone(), updated); // refresh cache so next push is current
+        self.last_pushed_status.insert(name.clone(), status.clone());
+    }
+    Err(ClientError::Conflict { .. }) => {        // ← EXPECTED, not exceptional
+        let latest = self.client.get_pod(name).await?;        // refetch fresh rv
+        let Some(latest) = latest else { return Ok(()) };     // let-else: gone? done.
+        let new_rv = latest.metadata.resource_version.clone()
+            .ok_or_else(|| anyhow!("refetched pod missing rv"))?;
+        self.cache.insert(name.clone(), latest);
+        self.client.replace_pod_status(name, status, &new_rv).await?; // retry ONCE
+        /* update cache + last_pushed_status again */
+    }
+    Err(e) => return Err(anyhow!(e)).context("status push"), // any other error propagates
+}
 ```
-   1. rv = cache[name].resourceVersion
-   2. PUT /pods/name/status?resourceVersion=rv  with the computed status
-        ├─ Ok(updated)        → cache[name] = updated; last_pushed_status[name] = status
-        └─ Err(Conflict)      → someone advanced rv first (a spec edit, or our own resync
-                                replaced the cache). Refetch the pod, take its fresh rv,
-                                retry the PUT ONCE with the new rv.
-```
-This is the §2 optimistic-concurrency dance, now driven from the client. The conflict is expected, not exceptional: the cached rv goes stale any time the apiserver advances it. The retry is a *single* bounded refetch-and-reapply — if it conflicts again, we give up and let the next 2s tick try fresh. (A retry *loop* would risk livelock against a hot-edited Pod; one shot keeps it simple and the tick provides natural backoff.)
+> Only the `Conflict` variant triggers the refetch-retry; everything else propagates. A *single* retry (not a loop) avoids livelock against a hot-edited Pod — if it conflicts again, the next 2s tick tries fresh. This is the §2 optimistic-concurrency dance, now driven from the client side. The conflict is expected, not exceptional: the cached rv goes stale any time the apiserver advances it. The retry is a *single* bounded refetch-and-reapply — if it conflicts again, we give up and let the next 2s tick try fresh. (A retry *loop* would risk livelock against a hot-edited Pod; one shot keeps it simple and the tick provides natural backoff.)
 
 **Decision — why the push lives in the liveness arm, split sync/async.** `tick_liveness` is synchronous and runs inside `block_in_place` (it makes blocking libcontainer calls, §7/§10). But `push_status` is async (HTTP). So the run loop does:
 ```rust
@@ -884,3 +1004,86 @@ _ = liveness_interval.tick() => {
 Compute synchronously (where the blocking runtime calls are), then `await` the network writes *outside* `block_in_place`. Mixing an `.await` inside `block_in_place` would be wrong — `block_in_place` is for blocking *sync* work, not for parking on a future. This clean split is the idiomatic way to bridge the sync runtime layer and the async client layer.
 
 **Validation.** `cargo check --all-targets` clean; full suite **76 tests, all passing** (up from Phase 1's 36) — including the four new `compute_status_*` phase-rollup tests and the `tick_liveness` dirty/dedup test.
+
+## 9. `mykubectl` — the command-line client (`src/bin/mykubectl.rs`)
+
+The human-facing front door. Medium.
+
+**What it is.** A `kubectl`-shaped CLI that is a *thin* UX layer over the §6 `Client` — no new protocol, no new types, just ergonomics. Three subcommands plus a global `--server` (env `MY_K8S_SERVER`, default `http://127.0.0.1:8080`):
+```
+   mykubectl apply -f web.yml          create-or-update a Pod from YAML
+   mykubectl get pods                  table of all Pods
+   mykubectl get pod web               one Pod as YAML
+   mykubectl get pods -w               stream live changes as a table
+   mykubectl delete pod web            delete by name
+```
+
+**Concept — `apply` is an upsert (get → branch → create-or-replace).** This is the most interesting command. `kubectl apply` means "make the cluster match this file" whether or not the object exists yet. Ours does the minimal version:
+```
+   read YAML → Pod
+   client.get_pod(name)?
+     Some(existing) → copy existing.resourceVersion into our Pod → replace_pod_spec()   ("replaced")
+     None           → create_pod()                                                       ("created")
+```
+The `resource_version` copy is the key line: a PUT needs the *current* rv (§2 optimistic concurrency), and the user's YAML file doesn't carry one — so `apply` fetches it first. This is a deliberately simplified apply: real `kubectl` does a three-way merge (last-applied vs live vs desired); we just last-writer-wins with the freshly-read rv. Honest shortcut, same user-facing shape.
+
+**Concept — `get` renders status, not just spec.** Listing prints the familiar table by reading the **status** subresource the kubelet reports (§8):
+```
+   NAME                 PHASE      READY    RESTARTS   AGE
+   web                  Running    1/1      0          12s
+```
+- `PHASE` ← `status.phase` (or `Pending` if status absent yet)
+- `READY` ← count of `container_statuses` with `ready == true` / total containers
+- `RESTARTS` ← sum of per-container `restart_count`
+- `AGE` ← now − `metadata.creationTimestamp`, humanized (`12s`, `5m`, `3h`, `2d`)
+
+This is the payoff of the §8 status loop: the kubelet writes observed state up, and now a *different* process — `mykubectl`, talking only to the apiserver, never touching the node — renders it. Single-pod `get pod web` prints full YAML instead (serde round-trips the Pod back out via `serde_yaml_ng`).
+
+**Concept — `get -w` reuses the watch stream.** With `-w`, `get` opens `client.watch_pods(None)` and prints each event as a row (`EVENT  PHASE  NAME`) as it arrives — the same NDJSON stream the kubelet consumes (§6), now driving a human display. Optional name filter just skips non-matching events. Watching the apiserver from the CLI and from the kubelet are literally the same API call.
+
+**Concept — `delete` is read-rv-then-delete.** Like `apply`, delete needs the current rv (the DELETE endpoint requires `?resourceVersion=`, §4). So it `get_pod` first, pulls the rv, then `delete_pod(name, rv)`. A missing Pod is a clean error (`bail!`), not a panic.
+
+**Decision — `mykubectl` replaces the throwaway `scripts/myctl.sh`.** Phase 1 §14's `myctl.sh` (cat the debug.json through `jq`) was always labeled "Phase 2 will replace this with a real client." It now has: `myctl.sh` reads a node-local debug file; `mykubectl` talks to the apiserver like a real client. The debug snapshot still exists as a kubelet-local introspection aid, but the *cluster* view now comes from `mykubectl`.
+
+## 10. End-to-end demo — the whole stack, live (verified 2026-06-01)
+
+This is the Phase 2 capstone, the analogue of Phase 1 §13 — but now spanning three processes (`apiserver`, `kubelet`, `mykubectl`) instead of one. Verified by hand on the VM; the sequence below is what was actually observed.
+
+**Runbook — bring the stack up:**
+```
+   # 0. one-time: rootfs (Phase 1) + the apiserver's DB dir, owned by the run user
+   sudo bash scripts/prepare-rootfs.sh
+   sudo mkdir -p /var/lib/my-k8s/etcd-like && sudo chown raycho /var/lib/my-k8s/etcd-like
+
+   # 1. apiserver (NON-root) — owns desired state in sled
+   cargo run --bin apiserver                       # listens 0.0.0.0:8080, db /var/lib/my-k8s/etcd-like
+
+   # 2. kubelet (root — needs namespaces) — informer client of the apiserver
+   sudo target/debug/kubelet --api-server-url http://127.0.0.1:8080
+
+   # 3. drive it from the CLI
+   mykubectl apply -f manifests/examples/web.yml
+   mykubectl get pods           # → web  Running  1/1  0  <age>
+```
+
+**What was verified (each step proves a Phase 2 concept):**
+1. **apply → watch → run → serve.** `mykubectl apply web.yml` → the kubelet's watch fires `ADDED` almost instantly → it builds the sandbox + httpd container → `mykubectl get pods` shows `Running 1/1` once status is pushed back → `curl` against the pod IP returns the served body. *Proves: the full desired→watch→run→status→observe loop.*
+2. **kubelet crash + restart → reattach, no disruption.** `kill -9` the kubelet, restart it → logs show `recover_all` count=2 (pause + httpd) → `from_recovered` reattaches the existing sandbox → **the httpd PID is unchanged and no duplicate containers spawn**. *Proves: §7 startup recovery — a kubelet restart doesn't disturb running Pods.*
+3. **delete → graceful teardown.** `mykubectl delete pod web` → the watch fires `DELETED` → the sandbox tears down after the 5s SIGTERM grace (Phase 1 §7). *Proves: deletion propagates apiserver → watch → runtime.*
+4. **apiserver crash + restart → state persists.** `kill -9` the apiserver, restart it → a previously-applied `sidecar-demo` Pod is **still there**, read back from sled. *Proves: §2 persistence — desired state outlives the apiserver process.*
+
+**Gotcha — `with_graceful_shutdown` hangs while a watch is open.** A watch is an infinite HTTP response; axum's graceful shutdown waits for in-flight requests to drain, and that one never does. So stopping the apiserver while a kubelet is watching needs `kill -9`. Real K8s sends a stream-close frame to watchers on shutdown; we don't (yet). Known limitation.
+
+**Gotcha — sled is single-writer.** Starting a second apiserver on the same DB fails cleanly with `could not acquire lock` — sled holds an exclusive lock, which *prevents* DB corruption from two writers. (Good: it fails safe. Implication: only one apiserver per DB, as expected for Phase 2.)
+
+**Gotcha — the apiserver runs non-root, the kubelet runs as root.** The kubelet needs root for namespace creation; the apiserver doesn't need it and shouldn't have it. But the default DB path lives under root-owned `/var/lib/my-k8s/`, so its parent must be pre-created and `chown`ed to the run user (see runbook step 0). Two processes, two privilege levels, two state dirs: apiserver owns `/var/lib/my-k8s/etcd-like/`, kubelet owns `/var/lib/my-k8s/state/`.
+
+**Gotcha — manifest examples are `.yml`, and `pkill` can shoot your own shell.** The example files are `web.yml` / `sidecar.yml` (not `.yaml`). And over SSH, `pkill -f "target/debug/kubelet"` matches the *running command line that contains that string* — including your own — so it can kill your shell; use a bracket pattern like `pkill -f "[k]ubelet --api-server"` to avoid self-matching.
+
+## Phase 2 wrap — what this earned us
+
+A working two-tier control plane. Desired state now lives in a persistent, HTTP-served **apiserver** (axum + sled) instead of a local directory; the **kubelet** is an informer-style *client* that watches for spec changes, runs containers to match, and reports observed status back; and **`mykubectl`** drives the whole thing the way `kubectl` drives real K8s. The deep concepts we built rather than read about: **optimistic concurrency** (resourceVersion, read-modify-write, Conflict-retry), the **watch pattern** (list-then-watch, catch-up→live, Lagged→410→relist), the **informer** (watch for latency + resync for safety), the **spec/status split** with level-triggered status reporting, and **persistence + restart recovery** (a kubelet adopts live containers; an apiserver reloads from sled).
+
+What we explicitly did NOT build (deferred): real container start timestamps and exit codes (status carries placeholders), graceful watch-stream close on apiserver shutdown, image pull (still busybox-only), probes, volumes/env/limits. And there's still only one node.
+
+**Phase 3 (next) is controllers.** With a watchable API in place, the natural next layer is the controller pattern: a separate process that watches a higher-level resource (ReplicaSet) and reconciles Pods to match a desired count — recreating one when it's deleted. It's the same list-watch-reconcile loop the kubelet already runs, but operating on *Pods as its output* instead of containers. The watch API we just built is exactly what makes it possible.

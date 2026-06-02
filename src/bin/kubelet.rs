@@ -66,6 +66,9 @@ async fn main() -> Result<()> {
     info!(?args, "kubelet starting");
 
     let runtime = YoukiRuntime::new(args.state_dir.clone());
+    // `Arc<Client>` so the reconciler can share one client across its watch
+    // stream + status pushes. Since Phase 2 the kubelet is a pure apiserver
+    // client — no local manifests dir anymore.
     let client = Arc::new(Client::new(args.api_server_url.clone()));
     let reconciler = Reconciler::new(
         client,
@@ -75,6 +78,9 @@ async fn main() -> Result<()> {
         Some(args.state_dir.join("debug.json")),
     );
 
+    // Cooperative shutdown: a shared token both halves observe. `select!` races
+    // "signal arrived" against "reconciler exited on its own". `&mut task` polls
+    // the JoinHandle WITHOUT consuming it, so we can still await it again below.
     let cancel = CancellationToken::new();
     let mut reconciler_task = tokio::spawn(reconciler.run(cancel.clone()));
 
@@ -86,6 +92,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    // On signal: flip the token, then AWAIT the task so its sandbox teardown
+    // fully completes before main returns (graceful, not abrupt).
     if received_signal {
         info!("shutdown signal received; draining reconciler");
         cancel.cancel();

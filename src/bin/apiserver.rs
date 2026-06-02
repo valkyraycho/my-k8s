@@ -10,12 +10,17 @@ use tokio::{
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+/// clap's derive API: `#[derive(Parser)]` turns this struct into a CLI parser,
+/// each field an `--flag`. `default_value` is parsed via the field's `FromStr`,
+/// so `--listen` validates as a real `SocketAddr` at parse time, not later.
 #[derive(Debug, Parser)]
 #[command(name = "apiserver", version)]
 struct Args {
     #[arg(long, default_value = "0.0.0.0:8080")]
     listen: SocketAddr,
 
+    /// sled DB dir — the persistent state. Runs NON-root, so this path under
+    /// root-owned /var/lib/my-k8s must be pre-created + chowned to the run user.
     #[arg(long, default_value = "/var/lib/my-k8s/etcd-like")]
     db: PathBuf,
 }
@@ -48,6 +53,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding {}", args.listen))?;
     info!("apiserver listening on {}", args.listen);
 
+    // `with_graceful_shutdown(future)`: stop accepting new connections and drain
+    // in-flight ones once the future resolves. KNOWN LIMITATION: a watch is an
+    // infinite response that never drains, so this hangs while a kubelet is
+    // watching — needs SIGKILL. Real K8s sends a stream-close frame; we don't.
     axum::serve(listener, app)
         .with_graceful_shutdown(wait_for_shutdown_signal())
         .await
