@@ -234,7 +234,7 @@ impl<R: RuntimeClient> Reconciler<R> {
         Ok(())
     }
 
-    fn apply_watch_event(&mut self, event: WatchEvent) {
+    fn apply_watch_event(&mut self, event: WatchEvent<Pod>) {
         let name = event.object.metadata.name.clone();
         let _span = info_span!("watch", pod = %name, ty = ?event.event_type).entered();
         match event.event_type {

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +41,22 @@ pub struct OwnerReference {
     /// True for the single managing controller (a Pod has at most one). K8s
     /// also has a `blockOwnerDeletion` field; we omit it (no finalizers yet).
     pub controller: bool,
+}
+
+/// What the generic `ResourceStore` needs from any stored resource: access to
+/// the shared `ObjectMeta`, a sled key prefix, and two status hooks. Each
+/// resource (Pod, ReplicaSet, ...) implements it by pointing at its embedded
+/// `metadata` field — the store never names a concrete type.
+pub trait ResourceMeta: Clone + Serialize + DeserializeOwned + Send + Sync + 'static {
+    /// sled key prefix for this kind, e.g. `"pods/"` or `"replicasets/"`.
+    const KIND_PREFIX: &'static str;
+    fn meta(&self) -> &ObjectMeta;
+    fn meta_mut(&mut self) -> &mut ObjectMeta;
+    /// Strip status on create — clients may not set status via create/apply.
+    fn clear_status(&mut self) {}
+    /// Preserve existing status across a spec replace (status changes only via
+    /// the `/status` subresource, never a spec PUT).
+    fn inherit_status(&mut self, _current: &Self) {}
 }
 
 #[cfg(test)]
@@ -84,7 +100,10 @@ mod tests {
         });
 
         let json = serde_json::to_string(&meta).unwrap();
-        assert!(json.contains(r#""labels":{"app":"web","tier":"frontend"}"#), "got: {json}");
+        assert!(
+            json.contains(r#""labels":{"app":"web","tier":"frontend"}"#),
+            "got: {json}"
+        );
         assert!(json.contains(r#""ownerReferences""#), "got: {json}");
         assert!(json.contains(r#""apiVersion":"apps/v1""#), "got: {json}");
         assert!(json.contains(r#""controller":true"#), "got: {json}");
@@ -97,11 +116,17 @@ mod tests {
     /// serialize to the same bytes, regardless of insertion order.
     #[test]
     fn labels_serialize_in_deterministic_order() {
-        let mut a = ObjectMeta { name: "x".into(), ..Default::default() };
+        let mut a = ObjectMeta {
+            name: "x".into(),
+            ..Default::default()
+        };
         a.labels.insert("z".into(), "1".into());
         a.labels.insert("a".into(), "2".into());
 
-        let mut b = ObjectMeta { name: "x".into(), ..Default::default() };
+        let mut b = ObjectMeta {
+            name: "x".into(),
+            ..Default::default()
+        };
         b.labels.insert("a".into(), "2".into());
         b.labels.insert("z".into(), "1".into());
 

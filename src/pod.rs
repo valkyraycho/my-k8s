@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::meta::ObjectMeta;
+use crate::meta::{ObjectMeta, ResourceMeta};
 
 pub type PodName = String;
 pub type ContainerName = String;
@@ -31,6 +31,22 @@ pub struct Pod {
     // `default`: deserializing a Pod that lacks the key yields `None`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub status: Option<PodStatus>,
+}
+
+impl ResourceMeta for Pod {
+    const KIND_PREFIX: &'static str = "pods/";
+    fn meta(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+    fn meta_mut(&mut self) -> &mut ObjectMeta {
+        &mut self.metadata
+    }
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
+    fn inherit_status(&mut self, current: &Self) {
+        self.status = current.status.clone();
+    }
 }
 
 /// Pod metadata is just the shared ObjectMeta. The alias keeps every existing

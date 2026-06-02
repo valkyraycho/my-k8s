@@ -8,18 +8,18 @@ use tokio_stream::Stream;
 use tracing::warn;
 
 use crate::{
-    apiserver::storage::{PodStore, StoreError},
-    pod::Pod,
+    apiserver::storage::{ResourceStore, StoreError},
+    meta::ResourceMeta,
 };
 
 /// One watch frame. `#[serde(rename = "type")]` — `type` is a Rust keyword, so
 /// the field is `event_type` in code but serializes to the K8s wire key `type`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WatchEvent {
+pub struct WatchEvent<T> {
     #[serde(rename = "type")]
     pub event_type: WatchEventType,
-    pub object: Pod,
+    pub object: T,
 }
 
 /// `rename_all = "UPPERCASE"` matches K8s's `ADDED`/`MODIFIED`/`DELETED`.
@@ -49,10 +49,10 @@ pub enum WatchError {
 /// `list()` snapshot: any write landing in between is then buffered in the
 /// broadcast channel and replayed live (deduped by the rv filter), so nothing
 /// slips through the gap.
-pub fn stream_events(
-    store: Arc<PodStore>,
+pub fn stream_events<T: ResourceMeta>(
+    store: Arc<ResourceStore<T>>,
     from_rv: u64,
-) -> impl Stream<Item = Result<WatchEvent, WatchError>> {
+) -> impl Stream<Item = Result<WatchEvent<T>, WatchError>> {
     // `try_stream!` lets us write a generator as straight-line async with
     // `yield`, instead of hand-implementing `Stream::poll_next`. Inside it, `?`
     // YIELDS the error as the final item and ends the stream.
@@ -61,11 +61,11 @@ pub fn stream_events(
         let (snapshot, snapshot_rv) = store.list()?;
 
         // Catch-up: replay everything newer than the client's resume point.
-        for pod in snapshot {
-            if pod_rv(&pod) > from_rv {
+        for obj in snapshot {
+            if resource_rv(&obj) > from_rv {
                 yield WatchEvent {
                     event_type: WatchEventType::Added,
-                    object: pod,
+                    object: obj,
                 }
             }
         }
@@ -75,7 +75,7 @@ pub fn stream_events(
         loop {
             match rx.recv().await {
                 Ok(ev) => {
-                    if pod_rv(&ev.object) > snapshot_rv {
+                    if resource_rv(&ev.object) > snapshot_rv {
                         yield ev
                     }
                 }
@@ -93,8 +93,8 @@ pub fn stream_events(
     }
 }
 
-fn pod_rv(pod: &Pod) -> u64 {
-    pod.metadata
+fn resource_rv<T: ResourceMeta>(obj: &T) -> u64 {
+    obj.meta()
         .resource_version
         .as_deref()
         .and_then(|s| s.parse::<u64>().ok())
@@ -108,7 +108,8 @@ mod tests {
     use tokio::time::timeout;
     use tokio_stream::StreamExt;
 
-    use crate::pod::{Container, PodMetadata, PodSpec};
+    use crate::apiserver::storage::PodStore;
+    use crate::pod::{Container, Pod, PodMetadata, PodSpec};
 
     fn store() -> Arc<PodStore> {
         Arc::new(PodStore::open_temporary().expect("temp sled"))
@@ -237,7 +238,10 @@ mod tests {
             .expect("ok");
         assert_eq!(ev2.event_type, WatchEventType::Added);
         assert_eq!(ev2.object.metadata.name, "b");
-        assert!(pod_rv(&ev2.object) > 1, "live event rv must exceed snapshot_rv");
+        assert!(
+            resource_rv(&ev2.object) > 1,
+            "live event rv must exceed snapshot_rv"
+        );
     }
 
     #[tokio::test]

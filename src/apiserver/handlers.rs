@@ -221,7 +221,9 @@ pub async fn replace_pod_status(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
-    let updated = state.store.replace_status(&name, status, &rv)?;
+    let updated = state
+        .store
+        .replace_status(&name, &rv, |p| p.status = Some(status.clone()))?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
 

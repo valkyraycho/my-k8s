@@ -6,7 +6,8 @@ use std::path::Path;
 
 use crate::{
     apiserver::watch::{WatchEvent, WatchEventType},
-    pod::{Pod, PodStatus},
+    meta::ResourceMeta,
+    pod::Pod,
 };
 use chrono::Utc;
 // `as TxnAbort`: import-rename to shorten the very long `Conflictable...` name
@@ -14,7 +15,6 @@ use chrono::Utc;
 use sled::transaction::{ConflictableTransactionError as TxnAbort, TransactionError};
 use thiserror::Error;
 use tokio::sync::broadcast;
-use uuid::Uuid;
 
 const RV_COUNTER_KEY: &[u8] = b"rv_counter";
 const POD_PREFIX: &str = "pods/";
@@ -40,22 +40,30 @@ pub enum StoreError {
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
+/// A Pod store is just a `ResourceStore` specialized to `Pod`. The alias keeps
+/// every existing `PodStore::...` call site (handlers, tests) compiling while
+/// the underlying type is now generic.
+pub type PodStore = ResourceStore<Pod>;
 
-/// `db` holds the pods (`pods/<name>` → JSON) and the rv counter; `rv_tree` is
-/// a secondary index (rv → name); `watch_tx` is the broadcast SENDER kept alive
-/// for the store's lifetime so subscribers can attach any time. Holding the
-/// Sender (even with no receivers) keeps the channel open.
-pub struct PodStore {
-    db: sled::Db,
-    rv_tree: sled::Tree,
-    watch_tx: broadcast::Sender<WatchEvent>,
+/// Open the shared sled DB once, then hand the same handle to every
+/// `ResourceStore` so they share ONE global `rv_counter` (etcd has a single
+/// global revision). Opening the same path twice would hit sled's exclusive
+/// single-writer lock — so multi-resource callers MUST go through this.
+pub fn open_db(path: impl AsRef<Path>) -> Result<sled::Db, StoreError> {
+    Ok(sled::open(path)?)
 }
 
-impl PodStore {
+pub struct ResourceStore<T: ResourceMeta> {
+    db: sled::Db,
+    rv_tree: sled::Tree,
+    watch_tx: broadcast::Sender<WatchEvent<T>>,
+}
+
+impl<T: ResourceMeta> ResourceStore<T> {
     fn from_db(db: sled::Db) -> Result<Self, StoreError> {
         let rv_tree = db.open_tree(RV_INDEX_TREE)?;
         let (watch_tx, _) = broadcast::channel(WATCH_CHANNEL_CAPACITY);
-        Ok(PodStore {
+        Ok(Self {
             db,
             rv_tree,
             watch_tx,
@@ -69,7 +77,7 @@ impl PodStore {
         Self::from_db(sled::Config::default().temporary(true).open()?)
     }
 
-    pub fn subscribe(&self) -> broadcast::Receiver<WatchEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<WatchEvent<T>> {
         self.watch_tx.subscribe()
     }
 
@@ -77,45 +85,48 @@ impl PodStore {
         Ok(self.db.get(RV_COUNTER_KEY)?.map(decode_u64).unwrap_or(0))
     }
 
-    pub fn get(&self, name: &str) -> Result<Option<Pod>, StoreError> {
-        let key = pod_key(name);
-        match self.db.get(key.as_bytes())? {
+    fn key(&self, name: &str) -> String {
+        format!("{}{}", T::KIND_PREFIX, name)
+    }
+
+    pub fn get(&self, name: &str) -> Result<Option<T>, StoreError> {
+        match self.db.get(self.key(name).as_bytes())? {
             Some(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             None => Ok(None),
         }
     }
 
-    pub fn list(&self) -> Result<(Vec<Pod>, u64), StoreError> {
-        let pods = self
+    pub fn list(&self) -> Result<(Vec<T>, u64), StoreError> {
+        let items = self
             .db
-            .scan_prefix(POD_PREFIX.as_bytes())
+            .scan_prefix(T::KIND_PREFIX.as_bytes())
             .map(|entry| {
                 let (_, bytes) = entry?;
                 Ok(serde_json::from_slice(&bytes)?)
             })
-            .collect::<Result<Vec<Pod>, StoreError>>()?;
+            .collect::<Result<Vec<T>, StoreError>>()?;
         let rv = self.current_rv()?;
-        Ok((pods, rv))
+        Ok((items, rv))
     }
 
-    pub fn create(&self, mut pod: Pod) -> Result<Pod, StoreError> {
-        // Server MINTS identity and CLOBBERS any client-supplied server fields:
-        // a client can't forge a uid, pin an rv, or pre-seed status. These five
-        // are apiserver-owned, full stop.
-        pod.metadata.uid = Some(Uuid::new_v4().to_string());
-        pod.metadata.generation = Some(1);
-        pod.metadata.creation_timestamp = Some(Utc::now().to_rfc3339());
-        pod.metadata.resource_version = None;
-        pod.status = None;
+    pub fn create(&self, mut obj: T) -> Result<T, StoreError> {
+        {
+            let m = obj.meta_mut();
+            m.uid = Some(uuid::Uuid::new_v4().to_string());
+            m.generation = Some(1);
+            m.creation_timestamp = Some(Utc::now().to_rfc3339());
+            m.resource_version = None;
+        }
+        obj.clear_status();
 
-        let name = pod.metadata.name.clone();
-        let key = pod_key(&name);
+        let name = obj.meta().name.clone();
+        let key = self.key(&name);
 
         // `db.transaction(closure)` runs the closure ATOMICALLY (sled retries it
         // on contention). The existence check, rv bump, and insert must be one
         // indivisible unit — else two concurrent creates could both pass the
         // "doesn't exist" check. The closure returns `Result<_, TxnAbort<_>>`.
-        let pod = self
+        let obj = self
             .db
             .transaction(|tx| {
                 if tx.get(key.as_bytes())?.is_some() {
@@ -124,43 +135,46 @@ impl PodStore {
                     return Err(TxnAbort::Abort(StoreError::AlreadyExists(name.clone())));
                 }
                 let rv = bump_rv(tx)?;
-                let mut p = pod.clone();
-                p.metadata.resource_version = Some(rv.to_string());
-                tx.insert(key.as_bytes(), to_json(&p)?)?;
-                Ok(p)
+                let mut o = obj.clone();
+                o.meta_mut().resource_version = Some(rv.to_string());
+                tx.insert(key.as_bytes(), to_json(&o)?)?;
+                Ok(o)
             })
             // `unwrap_txn` collapses sled's two-layer `TransactionError` back
             // into our flat `StoreError` (see its definition below).
             .map_err(unwrap_txn)?;
 
-        self.index_rv(&pod)?;
+        self.index_rv(&obj)?;
         // Fan the write out to all watch subscribers. Done AFTER the txn commits
         // so watchers never see an event for a write that rolled back.
-        emit(&self.watch_tx, WatchEventType::Added, pod.clone());
-        Ok(pod)
+        emit(&self.watch_tx, WatchEventType::Added, obj.clone());
+        Ok(obj)
     }
 
-    pub fn replace_spec(&self, name: &str, new_pod: Pod) -> Result<Pod, StoreError> {
-        let key = pod_key(name);
-        let provided_rv = new_pod.metadata.resource_version.clone();
+    pub fn replace_spec(&self, name: &str, new_obj: T) -> Result<T, StoreError> {
+        let key = self.key(name);
+        let provided_rv = new_obj.meta().resource_version.clone();
 
         let updated = self
             .db
             .transaction(|tx| {
-                let current = load_required_pod(tx, &key, name)?;
+                let current = load_required::<T>(tx, &key, name)?;
                 check_rv(&current, provided_rv.as_deref())?;
 
                 let rv = bump_rv(tx)?;
-                let mut p = new_pod.clone();
+                let mut o = new_obj.clone();
+                {
+                    let cm = current.meta().clone();
+                    let m = o.meta_mut();
+                    m.uid = cm.uid;
+                    m.creation_timestamp = cm.creation_timestamp;
+                    m.generation = Some(cm.generation.unwrap_or(0) + 1);
+                    m.resource_version = Some(rv.to_string());
+                }
+                o.inherit_status(&current);
 
-                p.metadata.uid = current.metadata.uid;
-                p.metadata.creation_timestamp = current.metadata.creation_timestamp;
-                p.metadata.generation = Some(current.metadata.generation.unwrap_or(0) + 1);
-                p.metadata.resource_version = Some(rv.to_string());
-                p.status = current.status;
-
-                tx.insert(key.as_bytes(), to_json(&p)?)?;
-                Ok(p)
+                tx.insert(key.as_bytes(), to_json(&o)?)?;
+                Ok(o)
             })
             .map_err(unwrap_txn)?;
 
@@ -169,24 +183,26 @@ impl PodStore {
         Ok(updated)
     }
 
-    pub fn replace_status(
+    /// Replace status via a caller-supplied mutator. The store stays ignorant of
+    /// the concrete status type — the closure (which knows `T`) does the field
+    /// assignment, e.g. `|p| p.status = Some(new_status)`.
+    pub fn replace_status<F: Fn(&mut T)>(
         &self,
         name: &str,
-        status: PodStatus,
         expected_rv: &str,
-    ) -> Result<Pod, StoreError> {
-        let key = pod_key(name);
+        mutate: F,
+    ) -> Result<T, StoreError> {
+        let key = self.key(name);
 
         let updated = self
             .db
             .transaction(|tx| {
-                let mut current = load_required_pod(tx, &key, name)?;
+                let mut current = load_required::<T>(tx, &key, name)?;
                 check_rv(&current, Some(expected_rv))?;
 
                 let rv = bump_rv(tx)?;
-
-                current.status = Some(status.clone());
-                current.metadata.resource_version = Some(rv.to_string());
+                mutate(&mut current);
+                current.meta_mut().resource_version = Some(rv.to_string());
 
                 tx.insert(key.as_bytes(), to_json(&current)?)?;
                 Ok(current)
@@ -198,17 +214,17 @@ impl PodStore {
         Ok(updated)
     }
 
-    pub fn delete(&self, name: &str, expected_rv: &str) -> Result<Pod, StoreError> {
-        let key = pod_key(name);
+    pub fn delete(&self, name: &str, expected_rv: &str) -> Result<T, StoreError> {
+        let key = self.key(name);
 
         let removed = self
             .db
             .transaction(|tx| {
-                let mut current: Pod = load_required_pod(tx, &key, name)?;
+                let mut current = load_required::<T>(tx, &key, name)?;
                 check_rv(&current, Some(expected_rv))?;
 
                 let rv = bump_rv(tx)?;
-                current.metadata.resource_version = Some(rv.to_string());
+                current.meta_mut().resource_version = Some(rv.to_string());
 
                 tx.remove(key.as_bytes())?;
                 Ok(current)
@@ -218,53 +234,48 @@ impl PodStore {
         emit(&self.watch_tx, WatchEventType::Deleted, removed.clone());
         Ok(removed)
     }
-
-    fn index_rv(&self, pod: &Pod) -> Result<(), StoreError> {
-        let Some(rv_str) = &pod.metadata.resource_version else {
+    fn index_rv(&self, obj: &T) -> Result<(), StoreError> {
+        let Some(rv_str) = &obj.meta().resource_version else {
             return Ok(());
         };
         let Ok(rv) = rv_str.parse::<u64>() else {
             return Ok(());
         };
         self.rv_tree
-            .insert(format!("{rv:020}").as_bytes(), pod.metadata.name.as_bytes())?;
+            .insert(format!("{rv:020}").as_bytes(), obj.meta().name.as_bytes())?;
         Ok(())
     }
-}
-
-fn pod_key(name: &str) -> String {
-    format!("{}{}", POD_PREFIX, name)
 }
 
 fn decode_u64(v: sled::IVec) -> u64 {
     v.as_ref().try_into().map(u64::from_le_bytes).unwrap_or(0)
 }
 
-fn to_json(pod: &Pod) -> Result<Vec<u8>, TxnAbort<StoreError>> {
-    serde_json::to_vec(pod).map_err(|e| TxnAbort::Abort(StoreError::Json(e)))
+fn to_json<T: ResourceMeta>(obj: &T) -> Result<Vec<u8>, TxnAbort<StoreError>> {
+    serde_json::to_vec(obj).map_err(|e| TxnAbort::Abort(StoreError::Json(e)))
 }
 
-fn from_json(bytes: &[u8]) -> Result<Pod, TxnAbort<StoreError>> {
-    serde_json::from_slice(bytes).map_err(|e| TxnAbort::Abort(StoreError::Json(e)))
-}
-
-fn load_required_pod(
+fn load_required<T: ResourceMeta>(
     tx: &sled::transaction::TransactionalTree,
     key: &str,
     name: &str,
-) -> Result<Pod, TxnAbort<StoreError>> {
+) -> Result<T, TxnAbort<StoreError>> {
     let bytes = tx
         .get(key.as_bytes())?
         .ok_or_else(|| TxnAbort::Abort(StoreError::NotFound(name.into())))?;
-    from_json(&bytes)
+
+    serde_json::from_slice(&bytes).map_err(|e| TxnAbort::Abort(StoreError::Json(e)))
 }
 
 /// The optimistic-concurrency gate. The caller must echo back the rv it read;
 /// a mismatch (or a missing rv — a client that forgot to fetch-then-PUT) is a
 /// `Conflict`. `match` with a guard (`Some(p) if p == current_rv`) is the
 /// idiomatic three-way branch: matches, mismatches, absent.
-fn check_rv(current: &Pod, provided: Option<&str>) -> Result<(), TxnAbort<StoreError>> {
-    let current_rv = current.metadata.resource_version.as_deref().unwrap_or("");
+fn check_rv<T: ResourceMeta>(
+    current: &T,
+    provided: Option<&str>,
+) -> Result<(), TxnAbort<StoreError>> {
+    let current_rv = current.meta().resource_version.as_deref().unwrap_or("");
     match provided {
         Some(p) if p == current_rv => Ok(()),
         Some(p) => Err(TxnAbort::Abort(StoreError::Conflict {
@@ -299,7 +310,11 @@ fn unwrap_txn(e: TransactionError<StoreError>) -> StoreError {
     }
 }
 
-fn emit(tx: &broadcast::Sender<WatchEvent>, event_type: WatchEventType, object: Pod) {
+fn emit<T: ResourceMeta>(
+    tx: &broadcast::Sender<WatchEvent<T>>,
+    event_type: WatchEventType,
+    object: T,
+) {
     let _ = tx.send(WatchEvent { event_type, object });
 }
 
@@ -424,7 +439,7 @@ mod tests {
         let store = store();
         let created = store.create(make_pod("web")).unwrap();
 
-        let with_status = store.replace_status("web", running_status(), "1").unwrap();
+        let with_status = store.replace_status("web", "1", |p| p.status = Some(running_status())).unwrap();
         assert_eq!(with_status.metadata.resource_version.as_deref(), Some("2"));
         assert_eq!(
             with_status.metadata.generation,
@@ -487,7 +502,7 @@ mod tests {
     fn replace_status_bumps_rv_but_not_generation() {
         let store = store();
         store.create(make_pod("web")).unwrap();
-        let updated = store.replace_status("web", running_status(), "1").unwrap();
+        let updated = store.replace_status("web", "1", |p| p.status = Some(running_status())).unwrap();
 
         assert_eq!(updated.metadata.resource_version.as_deref(), Some("2"));
         assert_eq!(
@@ -535,7 +550,7 @@ mod tests {
         let mut rx = store.subscribe(); // subscribe FIRST, before any writes
 
         let created = store.create(make_pod("web")).unwrap();
-        let updated = store.replace_status("web", running_status(), "1").unwrap();
+        let updated = store.replace_status("web", "1", |p| p.status = Some(running_status())).unwrap();
         let deleted = store.delete("web", "2").unwrap();
 
         let ev1 = rx.try_recv().expect("ADDED event");
@@ -552,5 +567,121 @@ mod tests {
 
         // No more events queued.
         assert!(rx.try_recv().is_err());
+    }
+}
+
+/// Proves the generic store works for ANY `ResourceMeta` type, not just `Pod`.
+/// A tiny `TestResource` (no relation to the real API types) exercises the same
+/// CRUD + rv + conflict machinery — if this passes, the abstraction is sound
+/// independent of the concrete resources, which is the whole point of step 2.
+#[cfg(test)]
+mod generic_tests {
+    use super::*;
+    use crate::meta::ObjectMeta;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+    struct TestResource {
+        metadata: ObjectMeta,
+        payload: u32,
+        status: Option<u32>,
+    }
+
+    impl ResourceMeta for TestResource {
+        const KIND_PREFIX: &'static str = "tests/";
+        fn meta(&self) -> &ObjectMeta {
+            &self.metadata
+        }
+        fn meta_mut(&mut self) -> &mut ObjectMeta {
+            &mut self.metadata
+        }
+        fn clear_status(&mut self) {
+            self.status = None;
+        }
+        fn inherit_status(&mut self, current: &Self) {
+            self.status = current.status;
+        }
+    }
+
+    fn store() -> ResourceStore<TestResource> {
+        ResourceStore::open_temporary().expect("temp sled")
+    }
+
+    fn make(name: &str, payload: u32) -> TestResource {
+        TestResource {
+            metadata: ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            payload,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn create_get_list_roundtrip_for_arbitrary_type() {
+        let store = store();
+        let created = store.create(make("a", 7)).unwrap();
+        assert_eq!(created.metadata.resource_version.as_deref(), Some("1"));
+        assert_eq!(created.payload, 7);
+        assert!(created.metadata.uid.is_some());
+
+        assert_eq!(store.get("a").unwrap(), Some(created));
+        let (items, rv) = store.list().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(rv, 1);
+    }
+
+    #[test]
+    fn stale_rv_replace_conflicts_for_arbitrary_type() {
+        let store = store();
+        store.create(make("a", 1)).unwrap(); // rv=1
+        let mut stale = make("a", 2);
+        stale.metadata.resource_version = Some("99".into());
+        let err = store.replace_spec("a", stale).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "got: {err:?}");
+    }
+
+    #[test]
+    fn replace_status_closure_mutates_arbitrary_type() {
+        let store = store();
+        store.create(make("a", 1)).unwrap(); // rv=1
+        let updated = store
+            .replace_status("a", "1", |r| r.status = Some(42))
+            .unwrap();
+        assert_eq!(updated.status, Some(42));
+        assert_eq!(updated.metadata.resource_version.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn prefix_isolates_kinds_sharing_one_db() {
+        // Two stores over the SAME sled::Db but different KIND_PREFIX must not
+        // see each other's objects, yet must share the global rv_counter.
+        let db = sled::Config::default().temporary(true).open().unwrap();
+        let tests = ResourceStore::<TestResource>::from_db(db.clone()).unwrap();
+        let pods = ResourceStore::<Pod>::from_db(db.clone()).unwrap();
+
+        tests.create(make("a", 1)).unwrap(); // global rv -> 1
+        let p = pods
+            .create(Pod {
+                api_version: "v1".into(),
+                kind: "Pod".into(),
+                metadata: ObjectMeta {
+                    name: "web".into(),
+                    ..Default::default()
+                },
+                spec: crate::pod::PodSpec { containers: vec![] },
+                status: None,
+            })
+            .unwrap(); // global rv -> 2
+
+        // Each store lists only its own kind...
+        assert_eq!(tests.list().unwrap().0.len(), 1);
+        assert_eq!(pods.list().unwrap().0.len(), 1);
+        assert!(tests.get("web").unwrap().is_none());
+        assert!(pods.get("a").unwrap().is_none());
+
+        // ...but the rv counter is shared: the Pod got rv=2, not rv=1.
+        assert_eq!(p.metadata.resource_version.as_deref(), Some("2"));
     }
 }

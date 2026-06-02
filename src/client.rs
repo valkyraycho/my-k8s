@@ -110,7 +110,7 @@ impl Client {
     pub async fn watch_pods(
         &self,
         from_rv: Option<&str>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent>> + Send>>> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<Pod>>> + Send>>> {
         let url = match from_rv {
             Some(rv) => self.url(&format!("/api/v1/pods?watch=true&resourceVersion={rv}")),
             None => self.url("/api/v1/pods?watch=true"),
@@ -129,7 +129,7 @@ impl Client {
             .map(|chunk| chunk.map_err(std::io::Error::other));
         let reader = StreamReader::new(bytes);
         let lines = FramedRead::new(reader, LinesCodec::new());
-        let events = lines.map(|line_res| -> Result<WatchEvent> {
+        let events = lines.map(|line_res| -> Result<WatchEvent<Pod>> {
             let line =
                 line_res.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             Ok(serde_json::from_str(&line)?)
