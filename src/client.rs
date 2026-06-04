@@ -8,8 +8,11 @@ use tokio_util::{
     io::StreamReader,
 };
 
-use crate::apiserver::watch::WatchEvent;
 use crate::pod::{Pod, PodStatus};
+use crate::{
+    apiserver::watch::WatchEvent,
+    replicaset::{ReplicaSet, ReplicaSetStatus},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -49,38 +52,22 @@ impl Client {
     }
 
     pub async fn list_pods(&self) -> Result<Vec<Pod>> {
-        let res = self.http.get(self.url("/api/v1/pods")).send().await?;
-        let list: PodList = parse_json(res).await?;
-        Ok(list.items)
+        self.list_resource("/api/v1/pods").await
     }
 
     /// Absence is `Ok(None)`, not an error — a missing Pod is a valid answer,
     /// so callers `match` on the Option instead of catching a NotFound error.
     pub async fn get_pod(&self, name: &str) -> Result<Option<Pod>> {
-        let res = self
-            .http
-            .get(self.url(&format!("/api/v1/pods/{}", name)))
-            .send()
-            .await?;
-        if res.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        Ok(Some(parse_json(res).await?))
+        self.get_resource(&format!("/api/v1/pods/{name}")).await
     }
+
     pub async fn create_pod(&self, pod: &Pod) -> Result<Pod> {
-        let res = self
-            .http
-            .post(self.url("/api/v1/pods"))
-            .json(pod)
-            .send()
-            .await?;
-        parse_json(res).await
+        self.create_resource("/api/v1/pods", pod).await
     }
 
     pub async fn replace_pod_spec(&self, pod: &Pod) -> Result<Pod> {
-        let url = self.url(&format!("/api/v1/pods/{}", pod.metadata.name));
-        let res = self.http.put(&url).json(pod).send().await?;
-        parse_json(res).await
+        self.put_resource(&format!("/api/v1/pods/{}", pod.metadata.name), pod)
+            .await
     }
 
     pub async fn replace_pod_status(
@@ -89,60 +76,138 @@ impl Client {
         status: &PodStatus,
         rv: &str,
     ) -> Result<Pod> {
-        let url = self.url(&format!("/api/v1/pods/{name}/status?resourceVersion={rv}"));
-        let res = self.http.put(&url).json(status).send().await?;
-        parse_json(res).await
+        self.put_resource(
+            &format!("/api/v1/pods/{name}/status?resourceVersion={rv}"),
+            status,
+        )
+        .await
     }
 
     pub async fn delete_pod(&self, name: &str, rv: &str) -> Result<()> {
-        let url = self.url(&format!("/api/v1/pods/{name}?resourceVersion={rv}"));
-        let res = self.http.delete(&url).send().await?;
-        check_status(res).await?;
-        Ok(())
+        self.delete_resource(&format!("/api/v1/pods/{name}?resourceVersion={rv}"))
+            .await
     }
 
-    /// Open a watch and decode the NDJSON body into a typed event stream.
-    ///
-    /// Return type `Pin<Box<dyn Stream<...> + Send>>`: the concrete stream is a
-    /// tower of adapter types too unwieldy to name, so we box it into a trait
-    /// object. `Pin` is required because `Stream`s are polled in place and must
-    /// not move; `+ Send` lets the caller poll it from any tokio worker thread.
     pub async fn watch_pods(
         &self,
         from_rv: Option<&str>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<Pod>>> + Send>>> {
-        let url = match from_rv {
-            Some(rv) => self.url(&format!("/api/v1/pods?watch=true&resourceVersion={rv}")),
-            None => self.url("/api/v1/pods?watch=true"),
+        let path = match from_rv {
+            Some(rv) => format!("/api/v1/pods?watch=true&resourceVersion={rv}"),
+            None => "/api/v1/pods?watch=true".to_string(),
         };
-        let res = self.http.get(&url).send().await?;
+        self.watch_resource(&path).await
+    }
+
+    async fn list_resource<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
+        let res = self.http.get(self.url(path)).send().await?;
+        let list: ListEnvelope<T> = parse_json(res).await?;
+        Ok(list.items)
+    }
+
+    async fn get_resource<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
+        let res = self.http.get(self.url(path)).send().await?;
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(parse_json(res).await?))
+    }
+
+    async fn create_resource<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let res = self.http.post(self.url(path)).json(body).send().await?;
+        parse_json(res).await
+    }
+
+    async fn put_resource<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let res = self.http.put(self.url(path)).json(body).send().await?;
+        parse_json(res).await
+    }
+
+    async fn delete_resource(&self, path: &str) -> Result<()> {
+        let res = self.http.delete(self.url(path)).send().await?;
+        check_status(res).await?;
+        Ok(())
+    }
+
+    async fn watch_resource<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        path: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<T>>> + Send>>> {
+        let res = self.http.get(self.url(path)).send().await?;
         let res = check_status(res).await?;
 
-        // The adapter chain that turns an HTTP byte-stream into typed events —
-        // each link is a standard tokio combinator:
-        //   bytes_stream()            Stream<Result<Bytes>>     raw body chunks
-        //   → StreamReader::new       AsyncRead                 bytes-as-a-reader
-        //   → FramedRead + LinesCodec Stream<Result<String>>    split on '\n'
-        //   → .map(parse)             Stream<Result<WatchEvent>> typed events
         let bytes = res
             .bytes_stream()
             .map(|chunk| chunk.map_err(std::io::Error::other));
         let reader = StreamReader::new(bytes);
         let lines = FramedRead::new(reader, LinesCodec::new());
-        let events = lines.map(|line_res| -> Result<WatchEvent<Pod>> {
+        let events = lines.map(|line_res| -> Result<WatchEvent<T>> {
             let line =
                 line_res.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             Ok(serde_json::from_str(&line)?)
         });
-        // `Box::pin` heap-allocates and pins the stream so it can be returned as
-        // the `dyn Stream` trait object above.
         Ok(Box::pin(events))
+    }
+
+    pub async fn list_replicasets(&self) -> Result<Vec<ReplicaSet>> {
+        self.list_resource("/api/v1/replicasets").await
+    }
+
+    pub async fn get_replicaset(&self, name: &str) -> Result<Option<ReplicaSet>> {
+        self.get_resource(&format!("/api/v1/replicasets/{name}"))
+            .await
+    }
+
+    pub async fn create_replicaset(&self, rs: &ReplicaSet) -> Result<ReplicaSet> {
+        self.create_resource("/api/v1/replicasets", rs).await
+    }
+
+    pub async fn replace_replicaset_spec(&self, rs: &ReplicaSet) -> Result<ReplicaSet> {
+        self.put_resource(&format!("/api/v1/replicasets/{}", rs.metadata.name), rs)
+            .await
+    }
+
+    pub async fn replace_rs_status(
+        &self,
+        name: &str,
+        status: &ReplicaSetStatus,
+        rv: &str,
+    ) -> Result<ReplicaSet> {
+        self.put_resource(
+            &format!("/api/v1/replicasets/{name}/status?resourceVersion={rv}"),
+            status,
+        )
+        .await
+    }
+
+    pub async fn delete_replicaset(&self, name: &str, rv: &str) -> Result<()> {
+        self.delete_resource(&format!("/api/v1/replicasets/{name}?resourceVersion={rv}"))
+            .await
+    }
+
+    pub async fn watch_replicasets(
+        &self,
+        from_rv: Option<&str>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<ReplicaSet>>> + Send>>> {
+        let path = match from_rv {
+            Some(rv) => format!("/api/v1/replicasets?watch=true&resourceVersion={rv}"),
+            None => "/api/v1/replicasets?watch=true".to_string(),
+        };
+        self.watch_resource(&path).await
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct PodList {
-    items: Vec<Pod>,
+struct ListEnvelope<T> {
+    items: Vec<T>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -349,5 +414,88 @@ mod tests {
             .expect("watch event was Err");
 
         assert_eq!(event.object.metadata.name, "web");
+    }
+
+    // ---- ReplicaSet client methods (over the generic helpers) ----
+
+    fn make_rs(name: &str, replicas: u32) -> ReplicaSet {
+        use crate::replicaset::{LabelSelector, PodTemplateSpec, ReplicaSetSpec, TemplateObjectMeta};
+        let mut selector = LabelSelector::default();
+        selector.match_labels.insert("app".into(), name.into());
+        let mut tmpl = TemplateObjectMeta::default();
+        tmpl.labels.insert("app".into(), name.into());
+        ReplicaSet {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            metadata: PodMetadata {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: ReplicaSetSpec {
+                replicas,
+                selector,
+                template: PodTemplateSpec {
+                    metadata: tmpl,
+                    spec: PodSpec { containers: vec![] },
+                },
+            },
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rs_create_then_list_and_get() {
+        let (client, _) = spawn_test_apiserver().await;
+        let created = client.create_replicaset(&make_rs("web", 3)).await.unwrap();
+        assert_eq!(created.spec.replicas, 3);
+        assert_eq!(created.metadata.resource_version.as_deref(), Some("1"));
+
+        let listed = client.list_replicasets().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].metadata.name, "web");
+
+        let got = client.get_replicaset("web").await.unwrap();
+        assert_eq!(got.expect("Some").metadata.name, "web");
+        assert!(client.get_replicaset("nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rs_replace_status_and_delete() {
+        use crate::replicaset::ReplicaSetStatus;
+        let (client, _) = spawn_test_apiserver().await;
+        let created = client.create_replicaset(&make_rs("web", 2)).await.unwrap();
+        let rv = created.metadata.resource_version.unwrap();
+
+        let status = ReplicaSetStatus {
+            replicas: 2,
+            ready_replicas: 1,
+            observed_generation: 1,
+        };
+        let updated = client.replace_rs_status("web", &status, &rv).await.unwrap();
+        assert_eq!(updated.status.unwrap().ready_replicas, 1);
+
+        let rv2 = updated.metadata.resource_version.unwrap();
+        client.delete_replicaset("web", &rv2).await.unwrap();
+        assert!(client.get_replicaset("web").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rs_watch_stream_receives_added_event() {
+        let (client, _) = spawn_test_apiserver().await;
+        let mut stream = client.watch_replicasets(Some("0")).await.unwrap();
+
+        let c2 = Client::new(client.base_url.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.create_replicaset(&make_rs("web", 1)).await.unwrap();
+        });
+
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("event was Err");
+        assert_eq!(event.object.metadata.name, "web");
+        assert_eq!(event.object.spec.replicas, 1);
     }
 }
