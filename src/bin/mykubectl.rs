@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use my_k8s::{
     client::Client,
     pod::{Pod, PodPhase},
+    replicaset::ReplicaSet,
 };
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokio_stream::StreamExt;
 
@@ -52,38 +54,68 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Just enough of the manifest to learn its `kind` before full parsing — so
+/// `apply` can route a Pod vs a ReplicaSet to the right endpoint.
+#[derive(Deserialize)]
+struct TypeMeta {
+    kind: String,
+}
+
 /// `apply` is an UPSERT: make the cluster match this file whether or not the
-/// Pod exists. We GET first to branch: if present, copy its current rv onto our
-/// Pod and PUT (the rv is required for the optimistic-concurrency check, and the
-/// YAML file doesn't carry one); if absent, POST. A deliberately simplified
-/// `kubectl apply` — real kubectl does a three-way merge; we just last-writer-wins.
+/// object exists. We peek at `kind`, then GET-to-branch: if present, copy its
+/// current rv onto our object and PUT (rv is required for the optimistic-
+/// concurrency check, and the YAML doesn't carry one); if absent, POST.
 async fn apply(client: &Client, file: &Path) -> Result<()> {
     let yaml = std::fs::read_to_string(file).with_context(|| format!("reading {file:?}"))?;
-    let mut pod = Pod::from_yaml(&yaml).context("parsing pod YAML")?;
+    let meta: TypeMeta = serde_yaml_ng::from_str(&yaml).context("reading kind from manifest")?;
 
-    match client.get_pod(&pod.metadata.name).await? {
-        Some(existing) => {
-            pod.metadata.resource_version = existing.metadata.resource_version;
-            let updated = client.replace_pod_spec(&pod).await?;
-            println!("pod/{} replaced", updated.metadata.name);
+    match meta.kind.as_str() {
+        "Pod" => {
+            let mut pod: Pod = serde_yaml_ng::from_str(&yaml).context("parsing Pod YAML")?;
+            match client.get_pod(&pod.metadata.name).await? {
+                Some(existing) => {
+                    pod.metadata.resource_version = existing.metadata.resource_version;
+                    let updated = client.replace_pod_spec(&pod).await?;
+                    println!("pod/{} replaced", updated.metadata.name);
+                }
+                None => {
+                    let created = client.create_pod(&pod).await?;
+                    println!("pod/{} created", created.metadata.name);
+                }
+            }
         }
-        None => {
-            let created = client.create_pod(&pod).await?;
-            println!("pod/{} created", created.metadata.name);
+        "ReplicaSet" => {
+            let mut rs: ReplicaSet =
+                serde_yaml_ng::from_str(&yaml).context("parsing ReplicaSet YAML")?;
+            match client.get_replicaset(&rs.metadata.name).await? {
+                Some(existing) => {
+                    rs.metadata.resource_version = existing.metadata.resource_version;
+                    let updated = client.replace_replicaset_spec(&rs).await?;
+                    println!("replicaset/{} replaced", updated.metadata.name);
+                }
+                None => {
+                    let created = client.create_replicaset(&rs).await?;
+                    println!("replicaset/{} created", created.metadata.name);
+                }
+            }
         }
+        other => bail!("unsupported kind {other:?}; only Pod and ReplicaSet are supported"),
     }
     Ok(())
 }
 
 async fn get(client: &Client, resource: &str, name: Option<String>, watch: bool) -> Result<()> {
-    if !matches!(resource, "pod" | "pods") {
-        bail!("unsupported resource {resource:?}; only 'pod' and 'pods' are supported");
+    match resource {
+        "pod" | "pods" => get_pods(client, name, watch).await,
+        "rs" | "replicaset" | "replicasets" => get_replicasets(client, name).await,
+        other => bail!("unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs"),
     }
+}
 
+async fn get_pods(client: &Client, name: Option<String>, watch: bool) -> Result<()> {
     if watch {
         return watch_pods(client, name).await;
     }
-
     match name {
         Some(name) => match client.get_pod(&name).await? {
             Some(pod) => print!(
@@ -92,10 +124,21 @@ async fn get(client: &Client, resource: &str, name: Option<String>, watch: bool)
             ),
             None => bail!("pod/{name:?} not found"),
         },
-        None => {
-            let pods = client.list_pods().await?;
-            print_pod_table(&pods);
-        }
+        None => print_pod_table(&client.list_pods().await?),
+    }
+    Ok(())
+}
+
+async fn get_replicasets(client: &Client, name: Option<String>) -> Result<()> {
+    match name {
+        Some(name) => match client.get_replicaset(&name).await? {
+            Some(rs) => print!(
+                "{}",
+                serde_yaml_ng::to_string(&rs).context("serializing replicaset")?
+            ),
+            None => bail!("replicaset/{name:?} not found"),
+        },
+        None => print_rs_table(&client.list_replicasets().await?),
     }
     Ok(())
 }
@@ -121,19 +164,30 @@ async fn watch_pods(client: &Client, name: Option<String>) -> Result<()> {
 }
 
 async fn delete(client: &Client, resource: &str, name: &str) -> Result<()> {
-    if !matches!(resource, "pod" | "pods") {
-        bail!("unsupported resource {resource:?}; only 'pod' and 'pods' are supported");
-    }
-    match client.get_pod(name).await? {
-        Some(pod) => {
-            let rv = pod
-                .metadata
-                .resource_version
-                .ok_or_else(|| anyhow::anyhow!("pod/{name:?} has no resource version"))?;
-            client.delete_pod(name, &rv).await?;
-            println!("pod/{name} deleted");
-        }
-        None => bail!("pod/{name:?} not found"),
+    match resource {
+        "pod" | "pods" => match client.get_pod(name).await? {
+            Some(pod) => {
+                let rv = pod
+                    .metadata
+                    .resource_version
+                    .ok_or_else(|| anyhow::anyhow!("pod/{name:?} has no resource version"))?;
+                client.delete_pod(name, &rv).await?;
+                println!("pod/{name} deleted");
+            }
+            None => bail!("pod/{name:?} not found"),
+        },
+        "rs" | "replicaset" | "replicasets" => match client.get_replicaset(name).await? {
+            Some(rs) => {
+                let rv = rs
+                    .metadata
+                    .resource_version
+                    .ok_or_else(|| anyhow::anyhow!("replicaset/{name:?} has no resource version"))?;
+                client.delete_replicaset(name, &rv).await?;
+                println!("replicaset/{name} deleted");
+            }
+            None => bail!("replicaset/{name:?} not found"),
+        },
+        other => bail!("unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs"),
     }
     Ok(())
 }
@@ -177,6 +231,32 @@ fn print_pod_table(pods: &[Pod]) {
             format!("{ready}/{total}"),
             restarts,
             age,
+        );
+    }
+}
+
+/// The `kubectl get rs` table: DESIRED (spec.replicas) vs CURRENT/READY (from
+/// status, written by the controller). The gap between DESIRED and CURRENT is
+/// the controller's work-in-progress.
+fn print_rs_table(items: &[ReplicaSet]) {
+    println!(
+        "{:<20} {:<9} {:<9} {:<9} AGE",
+        "NAME", "DESIRED", "CURRENT", "READY",
+    );
+    for rs in items {
+        let (current, ready) = match &rs.status {
+            Some(s) => (s.replicas, s.ready_replicas),
+            None => (0, 0),
+        };
+        let age = rs
+            .metadata
+            .creation_timestamp
+            .as_deref()
+            .map(age_str)
+            .unwrap_or_else(|| "<unknown>".into());
+        println!(
+            "{:<20} {:<9} {:<9} {:<9} {}",
+            rs.metadata.name, rs.spec.replicas, current, ready, age,
         );
     }
 }

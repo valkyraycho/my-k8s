@@ -188,3 +188,291 @@ fn is_ready(pod: &Pod) -> bool {
             && s.container_statuses.iter().all(|c| c.ready)
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::apiserver::{
+        handlers::AppState,
+        routes::router,
+        storage::{PodStore, ResourceStore},
+    };
+    use crate::pod::{Container, PodSpec};
+    use crate::replicaset::{PodTemplateSpec, ReplicaSetSpec, TemplateObjectMeta};
+
+    // ---- matches_selector: pure, table-driven ----
+
+    fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn selector(pairs: &[(&str, &str)]) -> LabelSelector {
+        LabelSelector {
+            match_labels: labels(pairs),
+        }
+    }
+
+    #[test]
+    fn selector_matching() {
+        // Empty selector matches everything (vacuous all()).
+        assert!(matches_selector(&labels(&[]), &selector(&[])));
+        assert!(matches_selector(&labels(&[("app", "web")]), &selector(&[])));
+
+        // Subset match: pod has the required label (plus extras) → match.
+        assert!(matches_selector(
+            &labels(&[("app", "web"), ("tier", "fe")]),
+            &selector(&[("app", "web")]),
+        ));
+
+        // Missing required label → no match.
+        assert!(!matches_selector(
+            &labels(&[("tier", "fe")]),
+            &selector(&[("app", "web")]),
+        ));
+
+        // Wrong value → no match.
+        assert!(!matches_selector(
+            &labels(&[("app", "db")]),
+            &selector(&[("app", "web")]),
+        ));
+
+        // Multiple required: ALL must match.
+        assert!(matches_selector(
+            &labels(&[("app", "web"), ("tier", "fe")]),
+            &selector(&[("app", "web"), ("tier", "fe")]),
+        ));
+        assert!(!matches_selector(
+            &labels(&[("app", "web")]),
+            &selector(&[("app", "web"), ("tier", "fe")]),
+        ));
+    }
+
+    #[test]
+    fn rs_key_for_pod_reads_controller_owner() {
+        let mut pod = make_bare_pod("web-x");
+        assert_eq!(rs_key_for_pod(&pod), None);
+
+        pod.metadata.owner_references.push(OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            name: "web".into(),
+            uid: "u1".into(),
+            controller: true,
+        });
+        assert_eq!(rs_key_for_pod(&pod), Some("web".into()));
+    }
+
+    // ---- reconcile: against an in-process apiserver ----
+
+    async fn spawn_apiserver() -> Client {
+        let db = sled::Config::default()
+            .temporary(true)
+            .open()
+            .expect("temp db");
+        let pod_store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
+        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db).expect("rs store"));
+        let app = router(AppState {
+            store: pod_store,
+            rs_store,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        Client::new(format!("http://{addr}"))
+    }
+
+    fn make_rs(name: &str, replicas: u32) -> ReplicaSet {
+        ReplicaSet {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            metadata: ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: ReplicaSetSpec {
+                replicas,
+                selector: selector(&[("app", name)]),
+                template: PodTemplateSpec {
+                    metadata: TemplateObjectMeta {
+                        labels: labels(&[("app", name)]),
+                    },
+                    spec: PodSpec {
+                        containers: vec![Container {
+                            name: "c".into(),
+                            image: "busybox".into(),
+                            command: vec!["sleep".into(), "1".into()],
+                        }],
+                    },
+                },
+            },
+            status: None,
+        }
+    }
+
+    fn make_bare_pod(name: &str) -> Pod {
+        Pod {
+            api_version: "v1".into(),
+            kind: "Pod".into(),
+            metadata: ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: PodSpec {
+                containers: vec![Container {
+                    name: "c".into(),
+                    image: "busybox".into(),
+                    command: vec!["sleep".into(), "1".into()],
+                }],
+            },
+            status: None,
+        }
+    }
+
+    async fn owned_pod_count(client: &Client, rs_name: &str) -> usize {
+        client
+            .list_pods()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|p| is_owned_by(p, rs_name))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn reconcile_creates_deficit_pods() {
+        let client = spawn_apiserver().await;
+        client.create_replicaset(&make_rs("web", 3)).await.unwrap();
+
+        reconcile("web", &client).await.unwrap();
+
+        let pods = client.list_pods().await.unwrap();
+        assert_eq!(pods.len(), 3, "should create 3 pods to meet replicas");
+        for p in &pods {
+            assert!(is_owned_by(p, "web"), "pod {} missing ownerRef", p.metadata.name);
+            assert_eq!(p.metadata.labels.get("app").map(String::as_str), Some("web"));
+            assert!(p.metadata.name.starts_with("web-"));
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent() {
+        let client = spawn_apiserver().await;
+        client.create_replicaset(&make_rs("web", 2)).await.unwrap();
+
+        reconcile("web", &client).await.unwrap();
+        reconcile("web", &client).await.unwrap(); // must NOT over-create
+        reconcile("web", &client).await.unwrap();
+
+        assert_eq!(owned_pod_count(&client, "web").await, 2);
+    }
+
+    #[tokio::test]
+    async fn reconcile_deletes_surplus_pods() {
+        let client = spawn_apiserver().await;
+        let rs = client.create_replicaset(&make_rs("web", 1)).await.unwrap();
+
+        for i in 0..3 {
+            let mut pod = make_bare_pod(&format!("web-pre{i}"));
+            pod.metadata.labels = labels(&[("app", "web")]);
+            pod.metadata.owner_references.push(OwnerReference {
+                api_version: "apps/v1".into(),
+                kind: "ReplicaSet".into(),
+                name: "web".into(),
+                uid: rs.metadata.uid.clone().unwrap(),
+                controller: true,
+            });
+            client.create_pod(&pod).await.unwrap();
+        }
+        assert_eq!(owned_pod_count(&client, "web").await, 3);
+
+        reconcile("web", &client).await.unwrap();
+
+        assert_eq!(
+            owned_pod_count(&client, "web").await,
+            1,
+            "should delete 2 surplus pods down to replicas=1",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_adopts_matching_orphan() {
+        let client = spawn_apiserver().await;
+        client.create_replicaset(&make_rs("web", 1)).await.unwrap();
+
+        let mut orphan = make_bare_pod("lonely");
+        orphan.metadata.labels = labels(&[("app", "web")]);
+        client.create_pod(&orphan).await.unwrap();
+
+        reconcile("web", &client).await.unwrap();
+
+        let pods = client.list_pods().await.unwrap();
+        assert_eq!(pods.len(), 1, "orphan adopted, no extra pod created");
+        assert!(is_owned_by(&pods[0], "web"));
+        assert_eq!(pods[0].metadata.name, "lonely");
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_adopt_pod_owned_by_another_rs() {
+        let client = spawn_apiserver().await;
+        client.create_replicaset(&make_rs("web", 1)).await.unwrap();
+
+        let mut taken = make_bare_pod("taken");
+        taken.metadata.labels = labels(&[("app", "web")]);
+        taken.metadata.owner_references.push(OwnerReference {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            name: "other".into(),
+            uid: "other-uid".into(),
+            controller: true,
+        });
+        client.create_pod(&taken).await.unwrap();
+
+        reconcile("web", &client).await.unwrap();
+
+        assert_eq!(owned_pod_count(&client, "web").await, 1);
+        let taken_now = client.get_pod("taken").await.unwrap().unwrap();
+        assert!(!is_owned_by(&taken_now, "web"), "must not steal another RS's pod");
+    }
+
+    #[tokio::test]
+    async fn reconcile_cascade_deletes_when_rs_gone() {
+        let client = spawn_apiserver().await;
+        client.create_replicaset(&make_rs("web", 2)).await.unwrap();
+        reconcile("web", &client).await.unwrap();
+        assert_eq!(owned_pod_count(&client, "web").await, 2);
+
+        let current = client.get_replicaset("web").await.unwrap().unwrap();
+        let rv = current.metadata.resource_version.clone().unwrap();
+        client.delete_replicaset("web", &rv).await.unwrap();
+
+        reconcile("web", &client).await.unwrap();
+
+        assert_eq!(
+            owned_pod_count(&client, "web").await,
+            0,
+            "cascade delete should remove all owned pods",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_updates_status_replica_count() {
+        let client = spawn_apiserver().await;
+        client.create_replicaset(&make_rs("web", 2)).await.unwrap();
+
+        reconcile("web", &client).await.unwrap();
+
+        let rs = client.get_replicaset("web").await.unwrap().unwrap();
+        let status = rs.status.expect("status should be set");
+        assert_eq!(status.replicas, 2, "status.replicas reflects owned pods");
+        assert_eq!(status.ready_replicas, 0, "no kubelet → none ready");
+    }
+}
