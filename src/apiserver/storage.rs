@@ -17,7 +17,6 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 const RV_COUNTER_KEY: &[u8] = b"rv_counter";
-const POD_PREFIX: &str = "pods/";
 const RV_INDEX_TREE: &str = "rv_index";
 /// Broadcast ring-buffer size. A watcher that falls >256 events behind gets
 /// `Lagged` and must re-list (see `watch.rs`). Bigger = more slack, more memory.
@@ -60,7 +59,7 @@ pub struct ResourceStore<T: ResourceMeta> {
 }
 
 impl<T: ResourceMeta> ResourceStore<T> {
-    fn from_db(db: sled::Db) -> Result<Self, StoreError> {
+    pub fn from_db(db: sled::Db) -> Result<Self, StoreError> {
         let rv_tree = db.open_tree(RV_INDEX_TREE)?;
         let (watch_tx, _) = broadcast::channel(WATCH_CHANNEL_CAPACITY);
         Ok(Self {
@@ -439,7 +438,9 @@ mod tests {
         let store = store();
         let created = store.create(make_pod("web")).unwrap();
 
-        let with_status = store.replace_status("web", "1", |p| p.status = Some(running_status())).unwrap();
+        let with_status = store
+            .replace_status("web", "1", |p| p.status = Some(running_status()))
+            .unwrap();
         assert_eq!(with_status.metadata.resource_version.as_deref(), Some("2"));
         assert_eq!(
             with_status.metadata.generation,
@@ -502,7 +503,9 @@ mod tests {
     fn replace_status_bumps_rv_but_not_generation() {
         let store = store();
         store.create(make_pod("web")).unwrap();
-        let updated = store.replace_status("web", "1", |p| p.status = Some(running_status())).unwrap();
+        let updated = store
+            .replace_status("web", "1", |p| p.status = Some(running_status()))
+            .unwrap();
 
         assert_eq!(updated.metadata.resource_version.as_deref(), Some("2"));
         assert_eq!(
@@ -550,7 +553,9 @@ mod tests {
         let mut rx = store.subscribe(); // subscribe FIRST, before any writes
 
         let created = store.create(make_pod("web")).unwrap();
-        let updated = store.replace_status("web", "1", |p| p.status = Some(running_status())).unwrap();
+        let updated = store
+            .replace_status("web", "1", |p| p.status = Some(running_status()))
+            .unwrap();
         let deleted = store.delete("web", "2").unwrap();
 
         let ev1 = rx.try_recv().expect("ADDED event");

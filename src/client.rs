@@ -199,16 +199,27 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::apiserver::{handlers::AppState, routes::router, storage::PodStore};
+    use crate::apiserver::{
+        handlers::AppState,
+        routes::router,
+        storage::{PodStore, ResourceStore},
+    };
     use crate::pod::{Container, Pod, PodMetadata, PodPhase, PodSpec};
+    use crate::replicaset::ReplicaSet;
 
     /// Spin up a real apiserver router on an OS-assigned port and return a
-    /// Client pointed at it, plus the shared store so tests can drive writes
+    /// Client pointed at it, plus the shared pod store so tests can drive writes
     /// from "outside" the HTTP path (useful for watch tests).
     async fn spawn_test_apiserver() -> (Client, Arc<PodStore>) {
-        let store = Arc::new(PodStore::open_temporary().expect("temp store"));
+        let db = sled::Config::default()
+            .temporary(true)
+            .open()
+            .expect("temp db");
+        let store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
+        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db).expect("rs store"));
         let app = router(AppState {
             store: store.clone(),
+            rs_store,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

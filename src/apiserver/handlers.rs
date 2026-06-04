@@ -14,10 +14,11 @@ use tracing::warn;
 
 use crate::{
     apiserver::{
-        storage::{PodStore, StoreError},
+        storage::{PodStore, ResourceStore, StoreError},
         watch::stream_events,
     },
     pod::{Pod, PodStatus},
+    replicaset::{ReplicaSet, ReplicaSetStatus},
 };
 
 /// Shared handler state. `Arc<PodStore>` so every handler (and every spawned
@@ -27,6 +28,7 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<PodStore>,
+    pub rs_store: Arc<ResourceStore<ReplicaSet>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,6 +229,130 @@ pub async fn replace_pod_status(
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplicaSetList {
+    pub kind: String,
+    pub api_version: String,
+    pub items: Vec<ReplicaSet>,
+}
+
+impl ReplicaSetList {
+    fn new(items: Vec<ReplicaSet>) -> Self {
+        Self {
+            kind: "ReplicaSetList".to_string(),
+            api_version: "apps/v1".to_string(),
+            items,
+        }
+    }
+}
+
+fn validate_replicaset(rs: &ReplicaSet) -> Result<(), ApiError> {
+    if rs.metadata.name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "metadata.name must not be empty".into(),
+        ));
+    }
+    if rs.spec.selector.match_labels.is_empty() {
+        return Err(ApiError::BadRequest(
+            "spec.selector.matchLabels must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn list_or_watch_replicasets(
+    State(state): State<AppState>,
+    Query(params): Query<ListWatchParams>,
+) -> Result<Response, ApiError> {
+    if params.watch.unwrap_or(false) {
+        let from_rv = parse_rv(params.resource_version.as_deref());
+        let stream = stream_events(state.rs_store.clone(), from_rv).map(|res| match res {
+            Ok(ev) => {
+                let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
+                bytes.push(b'\n');
+                Ok::<Vec<u8>, std::io::Error>(bytes)
+            }
+            Err(e) => {
+                warn!(error = %e, "watch stream error; closing connection");
+                Err(std::io::Error::other(e.to_string()))
+            }
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .map_err(|e| ApiError::Internal(format!("response build: {e}")))?;
+        Ok(response)
+    } else {
+        let (items, _rv) = state.rs_store.list()?;
+        Ok((StatusCode::OK, Json(ReplicaSetList::new(items))).into_response())
+    }
+}
+
+pub async fn create_replicaset(
+    State(state): State<AppState>,
+    Json(rs): Json<ReplicaSet>,
+) -> Result<Response, ApiError> {
+    validate_replicaset(&rs)?;
+    let created = state.rs_store.create(rs)?;
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+
+pub async fn get_replicaset(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let rs = state
+        .rs_store
+        .get(&name)?
+        .ok_or_else(|| ApiError::NotFound(name.clone()))?;
+    Ok((StatusCode::OK, Json(rs)).into_response())
+}
+
+pub async fn replace_replicaset_spec(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(rs): Json<ReplicaSet>,
+) -> Result<Response, ApiError> {
+    validate_replicaset(&rs)?;
+    if rs.metadata.name != name {
+        return Err(ApiError::BadRequest(format!(
+            "name in body ({}) does not match URL path ({name})",
+            rs.metadata.name
+        )));
+    }
+    let updated = state.rs_store.replace_spec(&name, rs)?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
+pub async fn delete_replicaset(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<RvParams>,
+) -> Result<Response, ApiError> {
+    let rv = params
+        .resource_version
+        .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    let deleted = state.rs_store.delete(&name, &rv)?;
+    Ok((StatusCode::OK, Json(deleted)).into_response())
+}
+
+pub async fn replace_replicaset_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<RvParams>,
+    Json(status): Json<ReplicaSetStatus>,
+) -> Result<Response, ApiError> {
+    let rv = params
+        .resource_version
+        .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    let updated = state
+        .rs_store
+        .replace_status(&name, &rv, |rs| rs.status = Some(status.clone()))?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
 fn parse_rv(s: Option<&str>) -> u64 {
     s.and_then(|s| s.parse().ok()).unwrap_or(0)
 }
@@ -257,14 +383,67 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::apiserver::routes::router;
+    use crate::apiserver::storage::ResourceStore;
     use crate::pod::{Container, PodMetadata, PodPhase, PodSpec};
+    use crate::replicaset::{
+        LabelSelector, PodTemplateSpec, ReplicaSet, ReplicaSetSpec, ReplicaSetStatus,
+        TemplateObjectMeta,
+    };
+
+    /// Build a router backed by both stores sharing ONE temp sled::Db (so the
+    /// global rv_counter is shared, mirroring production). Returns both stores
+    /// for tests that drive writes directly.
+    fn setup_full() -> (
+        axum::Router,
+        Arc<PodStore>,
+        Arc<ResourceStore<ReplicaSet>>,
+    ) {
+        let db = sled::Config::default()
+            .temporary(true)
+            .open()
+            .expect("temp db");
+        let pod_store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
+        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db).expect("rs store"));
+        let app = router(AppState {
+            store: pod_store.clone(),
+            rs_store: rs_store.clone(),
+        });
+        (app, pod_store, rs_store)
+    }
 
     fn setup() -> (axum::Router, Arc<PodStore>) {
-        let store = Arc::new(PodStore::open_temporary().expect("temp sled"));
-        let app = router(AppState {
-            store: store.clone(),
-        });
-        (app, store)
+        let (app, pod_store, _rs) = setup_full();
+        (app, pod_store)
+    }
+
+    fn make_replicaset(name: &str, replicas: u32) -> ReplicaSet {
+        let mut selector = LabelSelector::default();
+        selector.match_labels.insert("app".into(), name.into());
+        let mut tmpl = TemplateObjectMeta::default();
+        tmpl.labels.insert("app".into(), name.into());
+        ReplicaSet {
+            api_version: "apps/v1".into(),
+            kind: "ReplicaSet".into(),
+            metadata: crate::meta::ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: ReplicaSetSpec {
+                replicas,
+                selector,
+                template: PodTemplateSpec {
+                    metadata: tmpl,
+                    spec: PodSpec {
+                        containers: vec![Container {
+                            name: "c".into(),
+                            image: "busybox".into(),
+                            command: vec!["sleep".into(), "1".into()],
+                        }],
+                    },
+                },
+            },
+            status: None,
+        }
     }
 
     fn make_pod(name: &str) -> Pod {
@@ -493,5 +672,106 @@ mod tests {
         let pod = body_pod(res).await;
         assert!(pod.status.is_some());
         assert_eq!(pod.status.as_ref().unwrap().phase, PodPhase::Running);
+    }
+
+    // ---- ReplicaSet routes (parallel to the pod routes above) ----
+
+    async fn body_rs(res: Response) -> ReplicaSet {
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).expect("valid ReplicaSet body")
+    }
+
+    #[tokio::test]
+    async fn rs_create_returns_201_with_apiserver_fields() {
+        let (app, _, _) = setup_full();
+        let res = app
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/replicasets",
+                &make_replicaset("web", 3),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let rs = body_rs(res).await;
+        assert_eq!(rs.metadata.name, "web");
+        assert_eq!(rs.spec.replicas, 3);
+        assert!(rs.metadata.uid.is_some());
+        assert_eq!(rs.metadata.resource_version.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn rs_create_rejects_empty_selector() {
+        let (app, _, _) = setup_full();
+        let mut rs = make_replicaset("web", 3);
+        rs.spec.selector.match_labels.clear(); // empty selector → matches everything
+        let res = app
+            .oneshot(json_req(Method::POST, "/api/v1/replicasets", &rs))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = body_value(res).await;
+        assert_eq!(body["reason"], "BadRequest");
+    }
+
+    #[tokio::test]
+    async fn rs_list_wraps_in_replicasetlist() {
+        let (app, _, rs_store) = setup_full();
+        rs_store.create(make_replicaset("a", 1)).unwrap();
+        rs_store.create(make_replicaset("b", 2)).unwrap();
+        let res = app
+            .oneshot(empty_req(Method::GET, "/api/v1/replicasets"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_value(res).await;
+        assert_eq!(body["kind"], "ReplicaSetList");
+        assert_eq!(body["apiVersion"], "apps/v1");
+        assert_eq!(body["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rs_get_missing_returns_404() {
+        let (app, _, _) = setup_full();
+        let res = app
+            .oneshot(empty_req(Method::GET, "/api/v1/replicasets/nope"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rs_replace_status_persists_replica_counts() {
+        let (app, _, rs_store) = setup_full();
+        rs_store.create(make_replicaset("web", 3)).unwrap(); // rv=1
+        let status = ReplicaSetStatus {
+            replicas: 3,
+            ready_replicas: 2,
+            observed_generation: 1,
+        };
+        let res = app
+            .oneshot(json_req(
+                Method::PUT,
+                "/api/v1/replicasets/web/status?resourceVersion=1",
+                &status,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let rs = body_rs(res).await;
+        let st = rs.status.expect("status set");
+        assert_eq!(st.replicas, 3);
+        assert_eq!(st.ready_replicas, 2);
+    }
+
+    /// Pod and ReplicaSet stores share the global rv_counter (one sled::Db), so
+    /// interleaved creates get strictly increasing rvs across BOTH kinds.
+    #[tokio::test]
+    async fn pod_and_rs_share_global_resource_version() {
+        let (_app, pod_store, rs_store) = setup_full();
+        let p = pod_store.create(make_pod("web")).unwrap(); // rv=1
+        let rs = rs_store.create(make_replicaset("web", 1)).unwrap(); // rv=2
+        assert_eq!(p.metadata.resource_version.as_deref(), Some("1"));
+        assert_eq!(rs.metadata.resource_version.as_deref(), Some("2"));
     }
 }

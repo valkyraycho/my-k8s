@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::meta::ObjectMeta;
+use crate::meta::{ObjectMeta, ResourceMeta};
 use crate::pod::PodSpec;
 use std::collections::BTreeMap;
 
@@ -56,6 +56,22 @@ pub struct ReplicaSetStatus {
     pub observed_generation: u64,
 }
 
+impl ResourceMeta for ReplicaSet {
+    const KIND_PREFIX: &'static str = "replicasets/";
+    fn meta(&self) -> &ObjectMeta {
+        &self.metadata
+    }
+    fn meta_mut(&mut self) -> &mut ObjectMeta {
+        &mut self.metadata
+    }
+    fn clear_status(&mut self) {
+        self.status = None;
+    }
+    fn inherit_status(&mut self, current: &Self) {
+        self.status = current.status.clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,8 +104,19 @@ spec:
         let rs: ReplicaSet = serde_yaml_ng::from_str(yaml).expect("valid RS YAML");
         assert_eq!(rs.metadata.name, "web");
         assert_eq!(rs.spec.replicas, 3);
-        assert_eq!(rs.spec.selector.match_labels.get("app").map(String::as_str), Some("web"));
-        assert_eq!(rs.spec.template.metadata.labels.get("app").map(String::as_str), Some("web"));
+        assert_eq!(
+            rs.spec.selector.match_labels.get("app").map(String::as_str),
+            Some("web")
+        );
+        assert_eq!(
+            rs.spec
+                .template
+                .metadata
+                .labels
+                .get("app")
+                .map(String::as_str),
+            Some("web")
+        );
         assert_eq!(rs.spec.template.spec.containers.len(), 1);
         assert_eq!(rs.spec.template.spec.containers[0].name, "server");
         // No status on a freshly-applied manifest.
@@ -108,7 +135,10 @@ spec:
         let rs = ReplicaSet {
             api_version: "apps/v1".into(),
             kind: "ReplicaSet".into(),
-            metadata: ObjectMeta { name: "web".into(), ..Default::default() },
+            metadata: ObjectMeta {
+                name: "web".into(),
+                ..Default::default()
+            },
             spec: ReplicaSetSpec {
                 replicas: 2,
                 selector,

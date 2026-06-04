@@ -2,7 +2,14 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use my_k8s::apiserver::{handlers::AppState, routes::router, storage::PodStore};
+use my_k8s::{
+    apiserver::{
+        handlers::AppState,
+        routes::router,
+        storage::{PodStore, ResourceStore, open_db},
+    },
+    replicaset::ReplicaSet,
+};
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
@@ -41,10 +48,11 @@ async fn main() -> Result<()> {
             .with_context(|| format!("creating parent dir {parent:?} for sled DB"))?;
     }
 
-    let store =
-        PodStore::open(&args.db).with_context(|| format!("opening sled DB at {:?}", args.db))?;
+    let db = open_db(&args.db).with_context(|| format!("opening sled DB at {:?}", args.db))?;
+
     let state = AppState {
-        store: Arc::new(store),
+        store: Arc::new(PodStore::from_db(db.clone())?),
+        rs_store: Arc::new(ResourceStore::<ReplicaSet>::from_db(db)?),
     };
     let app = router(state);
 
