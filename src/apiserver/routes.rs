@@ -1,10 +1,10 @@
 use axum::{
     Router,
-    routing::{get, put},
+    routing::{get, post, put},
 };
 
 use crate::apiserver::handlers::{
-    AppState, create_node, create_pod, create_replicaset, delete_node, delete_pod,
+    AppState, bind_pod, create_node, create_pod, create_replicaset, delete_node, delete_pod,
     delete_replicaset, get_node, get_pod, get_replicaset, list_or_watch_nodes, list_or_watch_pods,
     list_or_watch_replicasets, replace_node_spec, replace_node_status, replace_pod_spec,
     replace_pod_status, replace_replicaset_spec, replace_replicaset_status,
@@ -43,5 +43,6 @@ pub fn router(state: AppState) -> Router {
             get(get_node).put(replace_node_spec).delete(delete_node),
         )
         .route("/api/v1/nodes/:name/status", put(replace_node_status))
+        .route("/api/v1/pods/:name/binding", post(bind_pod))
         .with_state(state)
 }

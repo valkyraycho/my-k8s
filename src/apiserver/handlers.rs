@@ -128,6 +128,14 @@ pub struct RvParams {
     pub resource_version: Option<String>,
 }
 
+/// The body of a binding request. Real K8s uses `{ target: { name } }`; we
+/// flatten to just the node name — placement is the only thing binding does.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Binding {
+    pub node_name: String,
+}
+
 /// One endpoint, two behaviors. axum EXTRACTORS in the args do the parsing:
 /// `State` pulls the shared store, `Query` deserializes `?watch=&resourceVersion=`
 /// into `ListWatchParams`. `?watch=true` → a streaming NDJSON body; otherwise →
@@ -228,6 +236,30 @@ pub async fn replace_pod_status(
     let updated = state
         .store
         .replace_status(&name, &rv, |p| p.status = Some(status.clone()))?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
+/// The binding subresource: how a pod gets *placed*. The scheduler POSTs here;
+/// we read the pod, stamp `spec.node_name`, and write it back via replace_spec
+/// (which preserves status and does its own rv check). Once node_name is set,
+/// that node's kubelet — and only that one — will run the pod.
+pub async fn bind_pod(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(binding): Json<Binding>,
+) -> Result<Response, ApiError> {
+    if binding.node_name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "binding.node_name must not be empty".into(),
+        ));
+    }
+
+    let mut pod = state
+        .store
+        .get(&name)?
+        .ok_or_else(|| ApiError::NotFound(name.clone()))?;
+    pod.spec.node_name = Some(binding.node_name);
+    let updated = state.store.replace_spec(&name, pod)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
 
@@ -527,7 +559,8 @@ mod tests {
             .open()
             .expect("temp db");
         let pod_store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
-        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
+        let rs_store =
+            Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
         let node_store = Arc::new(ResourceStore::<Node>::from_db(db).expect("node store"));
         let app = router(AppState {
             store: pod_store.clone(),
@@ -928,7 +961,11 @@ mod tests {
         let (app, _, _, _) = setup_full();
         let res = app
             .clone()
-            .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/nodes",
+                &make_node("node-a"),
+            ))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
@@ -965,7 +1002,10 @@ mod tests {
         let n = body_node(res).await;
         let st = n.status.expect("status set");
         assert!(st.ready);
-        assert_eq!(st.last_heartbeat_time.as_deref(), Some("2026-06-04T10:00:00Z"));
+        assert_eq!(
+            st.last_heartbeat_time.as_deref(),
+            Some("2026-06-04T10:00:00Z")
+        );
     }
 
     #[tokio::test]
@@ -976,5 +1016,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- Pod binding subresource ----
+
+    fn bind_body(node_name: &str) -> serde_json::Value {
+        serde_json::json!({ "nodeName": node_name })
+    }
+
+    #[tokio::test]
+    async fn binding_sets_node_name() {
+        let (app, store, _, _) = setup_full();
+        store.create(make_pod("web")).unwrap(); // unscheduled: node_name None
+        assert!(store.get("web").unwrap().unwrap().spec.node_name.is_none());
+
+        let res = app
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/pods/web/binding",
+                &bind_body("node-a"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bound = body_pod(res).await;
+        assert_eq!(bound.spec.node_name.as_deref(), Some("node-a"));
+        // Persisted, not just echoed.
+        assert_eq!(
+            store.get("web").unwrap().unwrap().spec.node_name.as_deref(),
+            Some("node-a"),
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_missing_pod_returns_404() {
+        let (app, _, _, _) = setup_full();
+        let res = app
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/pods/ghost/binding",
+                &bind_body("node-a"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn binding_empty_node_name_returns_400() {
+        let (app, store, _, _) = setup_full();
+        store.create(make_pod("web")).unwrap();
+        let res = app
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/pods/web/binding",
+                &bind_body(""),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn binding_is_idempotent() {
+        let (app, store, _, _) = setup_full();
+        store.create(make_pod("web")).unwrap();
+        for _ in 0..2 {
+            let res = app
+                .clone()
+                .oneshot(json_req(
+                    Method::POST,
+                    "/api/v1/pods/web/binding",
+                    &bind_body("node-a"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            store.get("web").unwrap().unwrap().spec.node_name.as_deref(),
+            Some("node-a"),
+        );
+    }
+
+    /// Route-collision guard: POST .../web/binding must hit bind_pod, NOT the
+    /// 3-segment /pods/:name handler (which only answers GET/PUT/DELETE). If the
+    /// router mis-dispatched, we'd get 405/404 instead of a successful bind.
+    #[tokio::test]
+    async fn binding_route_does_not_collide_with_pod_name_route() {
+        let (app, store, _, _) = setup_full();
+        store.create(make_pod("web")).unwrap();
+        let res = app
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/pods/web/binding",
+                &bind_body("node-a"),
+            ))
+            .await
+            .unwrap();
+        // A successful 200 (not 404/405) proves the 4-segment route matched.
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }
