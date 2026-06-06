@@ -2,6 +2,7 @@
 //! Each kubelet self-registers a Node and heartbeats its status; the scheduler
 //! only places pods onto Nodes that are Ready with a recent heartbeat.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::meta::{ObjectMeta, ResourceMeta};
@@ -37,6 +38,28 @@ pub struct NodeStatus {
     pub last_heartbeat_time: Option<String>,
 }
 
+impl Node {
+    /// Effective readiness: the kubelet reported Ready AND its heartbeat is
+    /// within `max_age_secs`. A dead kubelet leaves `status.ready == true`
+    /// forever (nothing flips it), so freshness — not the bool alone — is what
+    /// actually says the node is alive. Missing/unparseable timestamp → not ready.
+    pub fn is_ready(&self, now: DateTime<Utc>, max_age_secs: i64) -> bool {
+        let Some(status) = &self.status else {
+            return false;
+        };
+        if !status.ready {
+            return false;
+        }
+        match &status.last_heartbeat_time {
+            Some(ts) => match DateTime::parse_from_rfc3339(ts) {
+                Ok(hb) => (now - hb.with_timezone(&Utc)).num_seconds() < max_age_secs,
+                Err(_) => false,
+            },
+            None => false,
+        }
+    }
+}
+
 impl ResourceMeta for Node {
     const KIND_PREFIX: &'static str = "nodes/";
     fn meta(&self) -> &ObjectMeta {
@@ -68,6 +91,47 @@ mod tests {
             spec: NodeSpec::default(),
             status: None,
         }
+    }
+
+    #[test]
+    fn is_ready_requires_ready_bool_and_fresh_heartbeat() {
+        let now = Utc::now();
+        let window = 30;
+        let fresh = now.to_rfc3339();
+        let stale = (now - chrono::Duration::seconds(40)).to_rfc3339();
+
+        let mut n = node("node-a");
+
+        // No status → not ready.
+        assert!(!n.is_ready(now, window));
+
+        // Ready + fresh heartbeat → ready.
+        n.status = Some(NodeStatus {
+            ready: true,
+            last_heartbeat_time: Some(fresh.clone()),
+        });
+        assert!(n.is_ready(now, window));
+
+        // Ready bool true but heartbeat stale (a dead kubelet) → NOT ready.
+        n.status = Some(NodeStatus {
+            ready: true,
+            last_heartbeat_time: Some(stale),
+        });
+        assert!(!n.is_ready(now, window));
+
+        // ready=false even with a fresh heartbeat → not ready.
+        n.status = Some(NodeStatus {
+            ready: false,
+            last_heartbeat_time: Some(fresh),
+        });
+        assert!(!n.is_ready(now, window));
+
+        // Ready bool true but no heartbeat recorded → not ready.
+        n.status = Some(NodeStatus {
+            ready: true,
+            last_heartbeat_time: None,
+        });
+        assert!(!n.is_ready(now, window));
     }
 
     /// Round-trips through JSON with camelCase status keys and a Ready+heartbeat

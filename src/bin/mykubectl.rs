@@ -108,6 +108,7 @@ async fn get(client: &Client, resource: &str, name: Option<String>, watch: bool)
     match resource {
         "pod" | "pods" => get_pods(client, name, watch).await,
         "rs" | "replicaset" | "replicasets" => get_replicasets(client, name).await,
+        "node" | "nodes" => get_nodes(client, name).await,
         other => bail!("unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs"),
     }
 }
@@ -139,6 +140,20 @@ async fn get_replicasets(client: &Client, name: Option<String>) -> Result<()> {
             None => bail!("replicaset/{name:?} not found"),
         },
         None => print_rs_table(&client.list_replicasets().await?),
+    }
+    Ok(())
+}
+
+async fn get_nodes(client: &Client, name: Option<String>) -> Result<()> {
+    match name {
+        Some(name) => match client.get_node(&name).await? {
+            Some(node) => print!(
+                "{}",
+                serde_yaml_ng::to_string(&node).context("serializing node")?
+            ),
+            None => bail!("node/{name:?} not found"),
+        },
+        None => print_node_table(&client.list_nodes().await?),
     }
     Ok(())
 }
@@ -178,10 +193,9 @@ async fn delete(client: &Client, resource: &str, name: &str) -> Result<()> {
         },
         "rs" | "replicaset" | "replicasets" => match client.get_replicaset(name).await? {
             Some(rs) => {
-                let rv = rs
-                    .metadata
-                    .resource_version
-                    .ok_or_else(|| anyhow::anyhow!("replicaset/{name:?} has no resource version"))?;
+                let rv = rs.metadata.resource_version.ok_or_else(|| {
+                    anyhow::anyhow!("replicaset/{name:?} has no resource version")
+                })?;
                 client.delete_replicaset(name, &rv).await?;
                 println!("replicaset/{name} deleted");
             }
@@ -282,5 +296,27 @@ fn age_str(ts: &str) -> String {
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86400 => format!("{}h", s / 3600),
         s => format!("{}d", s / (86400)),
+    }
+}
+
+fn print_node_table(items: &[my_k8s::node::Node]) {
+    let now = chrono::Utc::now();
+    // Match the scheduler's default staleness window so the table agrees with
+    // what the scheduler would actually do (a dead node reads NotReady here).
+    const READY_WINDOW_SECS: i64 = 30;
+    println!("{:<16} {:<8} AGE", "NAME", "READY");
+    for n in items {
+        let ready = if n.is_ready(now, READY_WINDOW_SECS) {
+            "True"
+        } else {
+            "False"
+        };
+        let age = n
+            .metadata
+            .creation_timestamp
+            .as_deref()
+            .map(age_str)
+            .unwrap_or_else(|| "<unknown>".into());
+        println!("{:<16} {:<8} {}", n.metadata.name, ready, age);
     }
 }
