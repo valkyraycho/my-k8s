@@ -129,6 +129,7 @@ mod tests {
                     image: "busybox".into(),
                     command: vec!["sleep".into(), "1".into()],
                 }],
+                node_name: None,
             },
             status: None,
         }

@@ -795,6 +795,7 @@ mod tests {
                         command: cmd.into_iter().map(String::from).collect(),
                     })
                     .collect(),
+                node_name: None,
             },
             status: None,
         }

@@ -92,7 +92,7 @@ mod tests {
                 name: name.into(),
                 ..Default::default()
             },
-            spec: PodSpec { containers: vec![] },
+            spec: PodSpec { containers: vec![], node_name: None },
             status: None,
         };
         let sandbox = PodSandbox::new(

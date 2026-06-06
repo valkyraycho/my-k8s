@@ -17,6 +17,7 @@ use crate::{
         storage::{PodStore, ResourceStore, StoreError},
         watch::stream_events,
     },
+    node::{Node, NodeStatus},
     pod::{Pod, PodStatus},
     replicaset::{ReplicaSet, ReplicaSetStatus},
 };
@@ -29,6 +30,7 @@ use crate::{
 pub struct AppState {
     pub store: Arc<PodStore>,
     pub rs_store: Arc<ResourceStore<ReplicaSet>>,
+    pub node_store: Arc<ResourceStore<Node>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -373,6 +375,127 @@ fn validate_pod(pod: &Pod) -> Result<(), ApiError> {
     Ok(())
 }
 
+// ---- Node handlers (mirror the Pod/ReplicaSet handlers, over node_store) ----
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeList {
+    pub kind: String,
+    pub api_version: String,
+    pub items: Vec<Node>,
+}
+
+impl NodeList {
+    fn new(items: Vec<Node>) -> Self {
+        Self {
+            kind: "NodeList".to_string(),
+            api_version: "v1".to_string(),
+            items,
+        }
+    }
+}
+
+fn validate_node(node: &Node) -> Result<(), ApiError> {
+    if node.metadata.name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "metadata.name must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn list_or_watch_nodes(
+    State(state): State<AppState>,
+    Query(params): Query<ListWatchParams>,
+) -> Result<Response, ApiError> {
+    if params.watch.unwrap_or(false) {
+        let from_rv = parse_rv(params.resource_version.as_deref());
+        let stream = stream_events(state.node_store.clone(), from_rv).map(|res| match res {
+            Ok(ev) => {
+                let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
+                bytes.push(b'\n');
+                Ok::<Vec<u8>, std::io::Error>(bytes)
+            }
+            Err(e) => {
+                warn!(error = %e, "node watch stream error; closing connection");
+                Err(std::io::Error::other(e.to_string()))
+            }
+        });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .map_err(|e| ApiError::Internal(format!("response build: {e}")))?;
+        Ok(response)
+    } else {
+        let (items, _rv) = state.node_store.list()?;
+        Ok((StatusCode::OK, Json(NodeList::new(items))).into_response())
+    }
+}
+
+pub async fn create_node(
+    State(state): State<AppState>,
+    Json(node): Json<Node>,
+) -> Result<Response, ApiError> {
+    validate_node(&node)?;
+    let created = state.node_store.create(node)?;
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+
+pub async fn get_node(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let node = state
+        .node_store
+        .get(&name)?
+        .ok_or_else(|| ApiError::NotFound(name.clone()))?;
+    Ok((StatusCode::OK, Json(node)).into_response())
+}
+
+pub async fn replace_node_spec(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(node): Json<Node>,
+) -> Result<Response, ApiError> {
+    validate_node(&node)?;
+    if node.metadata.name != name {
+        return Err(ApiError::BadRequest(format!(
+            "name in body ({}) does not match URL path ({name})",
+            node.metadata.name
+        )));
+    }
+    let updated = state.node_store.replace_spec(&name, node)?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
+pub async fn delete_node(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<RvParams>,
+) -> Result<Response, ApiError> {
+    let rv = params
+        .resource_version
+        .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    let deleted = state.node_store.delete(&name, &rv)?;
+    Ok((StatusCode::OK, Json(deleted)).into_response())
+}
+
+pub async fn replace_node_status(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<RvParams>,
+    Json(status): Json<NodeStatus>,
+) -> Result<Response, ApiError> {
+    let rv = params
+        .resource_version
+        .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    let updated = state
+        .node_store
+        .replace_status(&name, &rv, |n| n.status = Some(status.clone()))?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,22 +520,25 @@ mod tests {
         axum::Router,
         Arc<PodStore>,
         Arc<ResourceStore<ReplicaSet>>,
+        Arc<ResourceStore<Node>>,
     ) {
         let db = sled::Config::default()
             .temporary(true)
             .open()
             .expect("temp db");
         let pod_store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
-        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db).expect("rs store"));
+        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
+        let node_store = Arc::new(ResourceStore::<Node>::from_db(db).expect("node store"));
         let app = router(AppState {
             store: pod_store.clone(),
             rs_store: rs_store.clone(),
+            node_store: node_store.clone(),
         });
-        (app, pod_store, rs_store)
+        (app, pod_store, rs_store, node_store)
     }
 
     fn setup() -> (axum::Router, Arc<PodStore>) {
-        let (app, pod_store, _rs) = setup_full();
+        let (app, pod_store, _rs, _node) = setup_full();
         (app, pod_store)
     }
 
@@ -439,6 +565,7 @@ mod tests {
                             image: "busybox".into(),
                             command: vec!["sleep".into(), "1".into()],
                         }],
+                        node_name: None,
                     },
                 },
             },
@@ -460,6 +587,7 @@ mod tests {
                     image: "busybox".into(),
                     command: vec!["sleep".into(), "1".into()],
                 }],
+                node_name: None,
             },
             status: None,
         }
@@ -683,7 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_create_returns_201_with_apiserver_fields() {
-        let (app, _, _) = setup_full();
+        let (app, _, _, _) = setup_full();
         let res = app
             .oneshot(json_req(
                 Method::POST,
@@ -702,7 +830,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_create_rejects_empty_selector() {
-        let (app, _, _) = setup_full();
+        let (app, _, _, _) = setup_full();
         let mut rs = make_replicaset("web", 3);
         rs.spec.selector.match_labels.clear(); // empty selector → matches everything
         let res = app
@@ -716,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_list_wraps_in_replicasetlist() {
-        let (app, _, rs_store) = setup_full();
+        let (app, _, rs_store, _node) = setup_full();
         rs_store.create(make_replicaset("a", 1)).unwrap();
         rs_store.create(make_replicaset("b", 2)).unwrap();
         let res = app
@@ -732,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_get_missing_returns_404() {
-        let (app, _, _) = setup_full();
+        let (app, _, _, _) = setup_full();
         let res = app
             .oneshot(empty_req(Method::GET, "/api/v1/replicasets/nope"))
             .await
@@ -742,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_replace_status_persists_replica_counts() {
-        let (app, _, rs_store) = setup_full();
+        let (app, _, rs_store, _node) = setup_full();
         rs_store.create(make_replicaset("web", 3)).unwrap(); // rv=1
         let status = ReplicaSetStatus {
             replicas: 3,
@@ -768,10 +896,85 @@ mod tests {
     /// interleaved creates get strictly increasing rvs across BOTH kinds.
     #[tokio::test]
     async fn pod_and_rs_share_global_resource_version() {
-        let (_app, pod_store, rs_store) = setup_full();
+        let (_app, pod_store, rs_store, _node) = setup_full();
         let p = pod_store.create(make_pod("web")).unwrap(); // rv=1
         let rs = rs_store.create(make_replicaset("web", 1)).unwrap(); // rv=2
         assert_eq!(p.metadata.resource_version.as_deref(), Some("1"));
         assert_eq!(rs.metadata.resource_version.as_deref(), Some("2"));
+    }
+
+    // ---- Node routes ----
+
+    fn make_node(name: &str) -> Node {
+        Node {
+            api_version: "v1".into(),
+            kind: "Node".into(),
+            metadata: crate::meta::ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: crate::node::NodeSpec::default(),
+            status: None,
+        }
+    }
+
+    async fn body_node(res: Response) -> Node {
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).expect("valid Node body")
+    }
+
+    #[tokio::test]
+    async fn node_create_get_list() {
+        let (app, _, _, _) = setup_full();
+        let res = app
+            .clone()
+            .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created = body_node(res).await;
+        assert_eq!(created.metadata.name, "node-a");
+        assert_eq!(created.metadata.resource_version.as_deref(), Some("1"));
+
+        let res = app
+            .oneshot(empty_req(Method::GET, "/api/v1/nodes"))
+            .await
+            .unwrap();
+        let body = body_value(res).await;
+        assert_eq!(body["kind"], "NodeList");
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn node_replace_status_sets_heartbeat() {
+        let (app, _, _, node_store) = setup_full();
+        node_store.create(make_node("node-a")).unwrap(); // rv=1
+        let status = NodeStatus {
+            ready: true,
+            last_heartbeat_time: Some("2026-06-04T10:00:00Z".into()),
+        };
+        let res = app
+            .oneshot(json_req(
+                Method::PUT,
+                "/api/v1/nodes/node-a/status?resourceVersion=1",
+                &status,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let n = body_node(res).await;
+        let st = n.status.expect("status set");
+        assert!(st.ready);
+        assert_eq!(st.last_heartbeat_time.as_deref(), Some("2026-06-04T10:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn node_create_rejects_empty_name() {
+        let (app, _, _, _) = setup_full();
+        let res = app
+            .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }

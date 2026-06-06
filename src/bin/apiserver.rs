@@ -8,6 +8,7 @@ use my_k8s::{
         routes::router,
         storage::{PodStore, ResourceStore, open_db},
     },
+    node::Node,
     replicaset::ReplicaSet,
 };
 use tokio::{
@@ -52,7 +53,8 @@ async fn main() -> Result<()> {
 
     let state = AppState {
         store: Arc::new(PodStore::from_db(db.clone())?),
-        rs_store: Arc::new(ResourceStore::<ReplicaSet>::from_db(db)?),
+        rs_store: Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone())?),
+        node_store: Arc::new(ResourceStore::<Node>::from_db(db)?),
     };
     let app = router(state);
 

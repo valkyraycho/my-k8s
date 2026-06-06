@@ -153,10 +153,13 @@ mod tests {
             .open()
             .expect("temp db");
         let pod_store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
-        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db).expect("rs store"));
+        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
+        let node_store =
+            Arc::new(ResourceStore::<crate::node::Node>::from_db(db).expect("node store"));
         let app = router(AppState {
             store: pod_store,
             rs_store,
+            node_store,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -197,6 +200,7 @@ mod tests {
                             image: "busybox".into(),
                             command: vec!["sleep".into(), "1".into()],
                         }],
+                        node_name: None,
                     },
                 },
             },

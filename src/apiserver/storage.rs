@@ -342,6 +342,7 @@ mod tests {
                     image: "busybox".into(),
                     command: vec!["sleep".into(), "1".into()],
                 }],
+                node_name: None,
             },
             status: None,
         }
@@ -675,7 +676,10 @@ mod generic_tests {
                     name: "web".into(),
                     ..Default::default()
                 },
-                spec: crate::pod::PodSpec { containers: vec![] },
+                spec: crate::pod::PodSpec {
+                    containers: vec![],
+                    node_name: None,
+                },
                 status: None,
             })
             .unwrap(); // global rv -> 2

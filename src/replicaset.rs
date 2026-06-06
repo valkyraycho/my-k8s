@@ -144,7 +144,7 @@ spec:
                 selector,
                 template: PodTemplateSpec {
                     metadata: tmpl_labels,
-                    spec: PodSpec { containers: vec![] },
+                    spec: PodSpec { containers: vec![], node_name: None },
                 },
             },
             status: Some(ReplicaSetStatus {

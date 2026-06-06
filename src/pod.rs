@@ -55,8 +55,12 @@ impl ResourceMeta for Pod {
 pub type PodMetadata = ObjectMeta;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PodSpec {
     pub containers: Vec<Container>,
+
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -275,6 +279,7 @@ spec:
                     image: "busybox".into(),
                     command: vec!["httpd".into()],
                 }],
+                node_name: None,
             },
             status: Some(PodStatus {
                 phase: PodPhase::Running,

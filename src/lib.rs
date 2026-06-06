@@ -16,6 +16,7 @@ pub mod apiserver;
 pub mod client;
 pub mod controller;
 pub mod meta;
+pub mod node;
 pub mod pod;
 pub mod reconciler;
 pub mod replicaset;
