@@ -18,6 +18,9 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     api_server_url: String,
 
+    #[arg(long, env = "NODE_NAME", default_value = "node-0")]
+    node_name: String,
+
     /// Where libcontainer keeps per-container state (analogous to runc's --root).
     /// Created on startup if missing.
     #[arg(long, default_value = "/var/lib/my-k8s/state")]
@@ -72,6 +75,7 @@ async fn main() -> Result<()> {
     let client = Arc::new(Client::new(args.api_server_url.clone()));
     let reconciler = Reconciler::new(
         client,
+        args.node_name.clone(),
         args.pods_dir(),
         args.rootfs_base.clone(),
         runtime,

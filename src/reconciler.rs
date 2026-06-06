@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -13,6 +14,8 @@ use tracing::{error, info, info_span, warn};
 use crate::{
     apiserver::watch::{WatchEvent, WatchEventType},
     client::{Client, ClientError},
+    meta::ObjectMeta,
+    node::{Node, NodeSpec, NodeStatus},
     pod::{ContainerStatus, ContainerStatusState, Pod, PodName, PodPhase, PodStatus},
     runtime::{ContainerState, RecoveredContainer, RuntimeClient, sandbox::PodSandbox},
     store::{PodState, Store},
@@ -25,6 +28,13 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
 /// How often to relist from the apiserver as a defense against missed watch
 /// events. Real K8s informers default to 10 minutes; 30s is fine for dev.
 const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How often the kubelet refreshes its Node's heartbeat. The scheduler treats a
+/// node as NotReady if its last heartbeat is older than its staleness window.
+#[cfg(not(test))]
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 
 // CrashLoopBackOff parameters. Production defaults follow real K8s
 // (10s base, 5min cap). Tests get tiny values so they run fast.
@@ -57,6 +67,7 @@ struct RestartTracker {
 /// PUTs so we only report on change, not every tick.
 pub struct Reconciler<R: RuntimeClient> {
     client: Arc<Client>,
+    node_name: String,
     pods_dir: PathBuf,
     rootfs_base: PathBuf,
     store: Store,
@@ -70,6 +81,7 @@ pub struct Reconciler<R: RuntimeClient> {
 impl<R: RuntimeClient> Reconciler<R> {
     pub fn new(
         client: Arc<Client>,
+        node_name: String,
         pods_dir: PathBuf,
         rootfs_base: PathBuf,
         runtime: R,
@@ -77,6 +89,7 @@ impl<R: RuntimeClient> Reconciler<R> {
     ) -> Self {
         Self {
             client,
+            node_name,
             pods_dir,
             rootfs_base,
             store: Store::new(),
@@ -98,9 +111,15 @@ impl<R: RuntimeClient> Reconciler<R> {
             return Err(e);
         }
 
+        let heartbeat = tokio::spawn(heartbeat_loop(
+            self.client.clone(),
+            self.node_name.clone(),
+            cancel.clone(),
+        ));
+
         let mut watch_stream = self
             .client
-            .watch_pods(Some("0"))
+            .watch_pods_on_node(&self.node_name, Some("0"))
             .await
             .context("opening watch stream")?;
 
@@ -153,11 +172,13 @@ impl<R: RuntimeClient> Reconciler<R> {
         }
 
         info!("reconciler shutting down; destroying all sandboxes");
+        heartbeat.abort();
         block_in_place(|| self.shutdown());
         Ok(())
     }
 
     async fn startup(&mut self) -> Result<()> {
+        self.register_node().await?;
         let recovered = block_in_place(|| self.runtime.recover_all())
             .context("recover containers from runtime state dir")?;
         info!(
@@ -167,7 +188,7 @@ impl<R: RuntimeClient> Reconciler<R> {
 
         let initial_pods = self
             .client
-            .list_pods()
+            .list_pods_on_node(&self.node_name)
             .await
             .context("initial list of pods from apiserver")?;
         info!(count = initial_pods.len(), "listed pods from apiserver");
@@ -231,6 +252,34 @@ impl<R: RuntimeClient> Reconciler<R> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Register this kubelet's Node with the apiserver. Create-or-exists: a
+    /// kubelet restart (or a registration race with another kubelet) hits
+    /// AlreadyExists, which we treat as success — the heartbeat will refresh
+    /// status either way.
+    async fn register_node(&self) -> Result<()> {
+        let node = Node {
+            api_version: "v1".into(),
+            kind: "Node".into(),
+            metadata: ObjectMeta {
+                name: self.node_name.clone(),
+                ..Default::default()
+            },
+            spec: NodeSpec::default(),
+            status: Some(NodeStatus {
+                ready: true,
+                last_heartbeat_time: Some(Utc::now().to_rfc3339()),
+            }),
+        };
+        match self.client.create_node(&node).await {
+            Ok(_) => info!(node = %self.node_name, "registered node"),
+            Err(ClientError::AlreadyExists) => {
+                info!(node = %self.node_name, "node already registered")
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)).context("register node"),
+        }
         Ok(())
     }
 
@@ -686,6 +735,35 @@ fn compute_backoff(restart_count: u32) -> Duration {
     Duration::from_micros(micros).min(BACKOFF_MAX)
 }
 
+async fn heartbeat_loop(client: Arc<Client>, node_name: String, cancel: CancellationToken) {
+    let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = interval.tick() => {}
+        }
+        match client.get_node(&node_name).await {
+            Ok(Some(node)) => {
+                let Some(rv) = node.metadata.resource_version.clone() else {
+                    continue;
+                };
+
+                let status = NodeStatus {
+                    ready: true,
+                    last_heartbeat_time: Some(Utc::now().to_rfc3339()),
+                };
+
+                if let Err(e) = client.replace_node_status(&node_name, &status, &rv).await {
+                    warn!(error = ?e, node = %node_name, "heartbeat status update failed");
+                }
+            }
+            Ok(None) => warn!(node = %node_name, "node missing during heartbeat"),
+            Err(e) => warn!(error = ?e, "heartbeat: get_node failed"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -808,7 +886,14 @@ mod tests {
         // Pointing at a closed port catches any accidental call with a fast
         // ConnectionRefused instead of hanging.
         let client = Arc::new(Client::new("http://127.0.0.1:1"));
-        Reconciler::new(client, pods_dir, rootfs, MockRuntime::default(), None)
+        Reconciler::new(
+            client,
+            "node-test".into(),
+            pods_dir,
+            rootfs,
+            MockRuntime::default(),
+            None,
+        )
     }
 
     fn desired_map(pods: Vec<Pod>) -> HashMap<PodName, Pod> {
@@ -1151,6 +1236,132 @@ mod tests {
         assert!(
             dirty2.is_empty(),
             "unchanged status must be deduped to avoid spurious /status PUTs",
+        );
+    }
+
+    // ---- node registration + heartbeat (against an in-process apiserver) ----
+
+    /// Spin up a real apiserver router and return a Client pointed at it.
+    async fn spawn_apiserver() -> Arc<Client> {
+        use crate::apiserver::{
+            handlers::AppState,
+            routes::router,
+            storage::{PodStore, ResourceStore},
+        };
+        use crate::node::Node;
+        use crate::replicaset::ReplicaSet;
+
+        let db = sled::Config::default()
+            .temporary(true)
+            .open()
+            .expect("temp db");
+        let app = router(AppState {
+            store: Arc::new(PodStore::from_db(db.clone()).unwrap()),
+            rs_store: Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).unwrap()),
+            node_store: Arc::new(ResourceStore::<Node>::from_db(db).unwrap()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Arc::new(Client::new(format!("http://{addr}")))
+    }
+
+    /// Build a reconciler whose client points at a real apiserver (for the
+    /// registration/heartbeat paths that actually hit HTTP).
+    fn reconciler_with(client: Arc<Client>, node_name: &str) -> Reconciler<MockRuntime> {
+        let pods_dir = unique_temp_dir(&format!("reg-{node_name}"));
+        let rootfs = std::env::temp_dir().join("nonexistent-rootfs");
+        Reconciler::new(
+            client,
+            node_name.into(),
+            pods_dir,
+            rootfs,
+            MockRuntime::default(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn register_node_creates_node() {
+        let client = spawn_apiserver().await;
+        let r = reconciler_with(client.clone(), "node-a");
+
+        r.register_node().await.unwrap();
+
+        // register_node ensures the Node OBJECT exists. Status is None right
+        // after create (the apiserver strips status on create — it's owned by
+        // the /status subresource); the heartbeat loop sets Ready shortly after.
+        let node = client
+            .get_node("node-a")
+            .await
+            .unwrap()
+            .expect("node exists");
+        assert_eq!(node.metadata.name, "node-a");
+    }
+
+    #[tokio::test]
+    async fn register_node_is_idempotent() {
+        let client = spawn_apiserver().await;
+        let r = reconciler_with(client.clone(), "node-a");
+
+        r.register_node().await.unwrap();
+        // Second registration hits AlreadyExists, which must be treated as Ok.
+        r.register_node().await.unwrap();
+        assert_eq!(client.list_nodes().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_loop_refreshes_last_heartbeat_time() {
+        let client = spawn_apiserver().await;
+        // Register a node with a deliberately old heartbeat.
+        let r = reconciler_with(client.clone(), "node-a");
+        r.register_node().await.unwrap();
+        let stale = "2000-01-01T00:00:00Z";
+        let rv = client
+            .get_node("node-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .resource_version
+            .unwrap();
+        client
+            .replace_node_status(
+                "node-a",
+                &NodeStatus {
+                    ready: true,
+                    last_heartbeat_time: Some(stale.into()),
+                },
+                &rv,
+            )
+            .await
+            .unwrap();
+
+        // Run the heartbeat loop (50ms interval in test) for a few ticks.
+        let cancel = CancellationToken::new();
+        let hb = tokio::spawn(heartbeat_loop(
+            client.clone(),
+            "node-a".into(),
+            cancel.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        cancel.cancel();
+        let _ = hb.await;
+
+        let hb_time = client
+            .get_node("node-a")
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+            .unwrap()
+            .last_heartbeat_time
+            .unwrap();
+        assert_ne!(
+            hb_time, stale,
+            "heartbeat should have refreshed the timestamp"
         );
     }
 }
