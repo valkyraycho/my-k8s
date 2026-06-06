@@ -31,12 +31,33 @@
 | 0 | Dev env + scaffold | `cargo run --bin scratch` runs busybox container ✅ |
 | 1 | Single-node "mini-kubelet" — the **Pod sandbox** primitive | `mykubelet` watches a manifests dir, runs multi-container Pods ✅ |
 | 2 | API server v1 | kubelet talks to API server over HTTP; multiple kubelets possible ✅ |
-| 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it ⬅ **next** |
-| 4 | Scheduler | Pods distributed across 2+ kubelets |
+| 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it ✅ |
+| 4 | Scheduler | Pods distributed across 2+ kubelets ⬅ **next** |
 | 5 | Services & networking | `curl` a Service VIP, traffic load-balances |
 | 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC |
 
 Phase 6 explicitly **dropped** "write your own runtime" — already done that in the prior Docker project. Replaced with distributed-systems content where the marginal learning is highest.
+
+---
+
+# Engineering principles, by example
+
+> **Why this section exists.** Writing code that works makes you a *developer*; knowing **what shape the code should take, and why** makes you a *software engineer*. The difference is judgment — about abstraction boundaries, trade-offs, failure modes, and when *not* to build something. This index collects the transferable engineering principles this project forced us to confront, each with a **judgment cue** (when to reach for it) and where you implemented it. None of these are K8s-specific; they travel to any system you build. Throughout the notes, a **⚙ Principle —** call-out flags where one shows up in context. Re-read this table periodically; the goal is to internalize the cues until they fire automatically.
+
+| Principle | Judgment cue — when to reach for it | Where you built it |
+|---|---|---|
+| **Program to an interface (a seam)** | You'll want to swap implementations *or* test a layer in isolation. One real impl + one mock already pays for the trait. | `RuntimeClient` (P1 §3); CRI analogy |
+| **Separate mechanism from policy** | A lower layer should expose *capabilities*; a higher layer decides *how to use them*. Keeps policy swappable without touching mechanism. | runtime primitives vs sandbox's graceful-term ladder (P1 §7) |
+| **Level-triggered, not edge-triggered** | React to the *difference* between desired and actual, recomputed from full state — not to the stream of events. Survives missed/duplicated events. | reconcile loops (P1 §10, P2 §7, P3 reconcile) |
+| **Idempotency & convergence** | Design an operation so running it twice is a no-op. Then you can retry freely and trigger on anything. | RS reconcile (P3); sandbox teardown |
+| **Optimistic concurrency for shared mutable state** | Prevent lost updates *without locks*: read a version token, write only if it hasn't changed; loser retries. | `resourceVersion` compare-and-set (P2 §2, §8) |
+| **Design for testability = design for modularity** | If something is painful to test, it's usually too coupled. A seam that enables a fast test almost always improves the structure too. | trait + mock (P1 §12); in-process apiserver tests (P2 §6, P3) |
+| **Defer complexity / rule of three** | Build the simplest thing that works. Add the abstraction when a *second* concrete case forces it — not in anticipation. | no `Arc<Mutex>` till shared (P2 §8); generic store added when RS arrived (P3) |
+| **Failure-mode-first thinking** | Ask "what happens on crash / partial failure / disconnect?" *before* the happy path — that's where real systems live. | restart recovery (P2 §7), partial-create rollback (P1 §10), watch lag→410 + reconnect (P2 §3, P3) |
+| **Avoid feedback loops in reactive systems** | When an action emits an event that re-triggers the same action, guard it with a "did anything actually change?" check. | status-write dedup (P2 §8, P3 reconcile) |
+| **Decouple producers from consumers with a queue** | A dedup queue absorbs bursts, collapses duplicates, and separates *arrival rate* from *processing rate*. | controller work queue (P3) |
+| **Model identity & ownership explicitly** | Names get reused; use a stable id (uid) and explicit ownership links for lifecycle, cascade-delete, "is this mine?". | `uid` (P2 §1), `ownerReferences` (P3) |
+| **Refactor without churn via aliases** | Generalize the implementation, keep the old name as a type alias so call sites don't all change at once. | `PodMetadata = ObjectMeta`, `PodStore = ResourceStore<Pod>` (P3) |
 
 ---
 
@@ -218,6 +239,8 @@ pub trait RuntimeClient {
 2. **The abstraction *is* the lesson.** Real K8s has CRI (Container Runtime Interface) for exactly this reason: separate *what* the orchestrator wants from *how* a runtime delivers it, and you can swap containerd ↔ CRI-O without touching the kubelet. We rebuilt the tiny version, so the design pressure that produced CRI is now something you've felt, not just read about.
 
 **Comparison to Go.** This is the same move as a Go interface — `type RuntimeClient interface { CreateContainer(...) error; ... }` with a real impl and a mock impl. The difference: in Go any type satisfies the interface implicitly if it has the methods; in Rust you write `impl RuntimeClient for YoukiRuntime` explicitly. Rust's version is checked at compile time and the intent is visible at the impl site.
+
+> **⚙ Principle — program to an interface (a seam), and let testability drive design.** Introducing a trait with *one* real implementation looks like over-engineering until you notice the second consumer it serves: the test suite. The same seam that would let you swap libcontainer for containerd is what lets `MockRuntime` stand in so the entire reconciler is testable without root or Linux. That's not a coincidence — *a boundary clean enough to mock is a boundary clean enough to swap*. Cue: when a layer is hard to test, the design is usually too coupled; reach for a seam, and you'll often find it improves modularity for free. (This is exactly the design pressure that produced real K8s's CRI.)
 
 **Decision — sync, not async.** The underlying syscalls (`fork`, `exec`, `clone`) are synchronous. Wrapping them in `async` buys nothing (there's no I/O to await) and spreads async "color" through code that doesn't need it. The reconciler bridges to async with `block_in_place` at the one boundary where it matters (§10).
 
@@ -413,7 +436,9 @@ And `destroy` tears down in **reverse dependency order** — all app containers 
 
 **Decision — `destroy()` removes app containers BEFORE the pause** (the ordering the diagram demands, in reverse). If the pause died first, every app container's shared net/ipc/uts namespace would be yanked out from under it mid-cleanup — the kernel could unbind `lo`, drop `/dev/shm`, etc., and the app teardown would hit undefined behavior. Tear down in reverse-dependency order: apps first (they're the dependents), pause last (it's the anchor). The `destroy_removes_app_containers_before_pause` test locks this in by asserting the delete-call ordering.
 
-**Decision — graceful-term polling lives here, not in `RuntimeClient`.** "SIGTERM, wait up to 5s, then force-delete" is an *orchestrator policy*, not a *runtime primitive*. The trait (§3) exposes the primitives (`kill_container`, `container_state`); the sandbox *composes* them into the policy. Keeping policy out of the trait means a different sandbox could choose a different grace period without anyone touching the runtime layer. (General principle: mechanisms go in the lower layer, policy in the higher one.)
+**Decision — graceful-term polling lives here, not in `RuntimeClient`.** "SIGTERM, wait up to 5s, then force-delete" is an *orchestrator policy*, not a *runtime primitive*. The trait (§3) exposes the primitives (`kill_container`, `container_state`); the sandbox *composes* them into the policy.
+
+> **⚙ Principle — separate mechanism from policy.** The runtime layer knows *how* to kill and query a container (mechanism); it has no opinion on *how long to wait* before force-killing (policy). Push the "how" down and keep the "how to use it" up, and you can change the grace period — or write a totally different teardown policy — without touching the layer that does the work. Cue: when a low-level module starts encoding decisions ("wait 5s", "retry 3×"), that's policy leaking downward; lift it to the caller and leave the module a clean set of verbs. It's the same split as `kill(2)` (mechanism) vs an init system's shutdown sequence (policy).
 
 **Decision — loopback set up via `nsenter`** (`setup_pod_network`, `#[cfg(not(test))]`). Right after the pause is up, we run `nsenter -t {pause_pid} -n ip link set lo up` to bring `lo` up *inside* the Pod's fresh network namespace (a brand-new netns has `lo` down). This is our stand-in for the CNI `loopback` plugin. We run it from the host (which holds `CAP_NET_ADMIN`) rather than granting that capability to the pause container — same security posture as real K8s, where the kubelet/CNI does the wiring, not the Pod.
 
@@ -474,6 +499,8 @@ This is the heart of K8s in 250 lines.
 Two properties fall out of this shape for free:
 - **Idempotent** — run it twice on an unchanged world and the second run does nothing (the diff is empty).
 - **Self-healing** — any drift (a crashed container, a hand-deleted manifest) is just diff that gets corrected on the next tick. Nobody has to *send* a repair command; the loop notices and converges.
+
+> **⚙ Principle — level-triggered beats edge-triggered for reliability.** An *edge-triggered* design reacts to events ("a Pod was deleted → recreate it"); if it ever misses an event, it's permanently wrong. A *level-triggered* design reacts to the *current gap between desired and actual* ("I want 3, I see 2 → make 1"), recomputed from full state every tick — so a missed or duplicated trigger costs you nothing but a little latency. This single choice is why K8s self-heals, and it recurs everywhere: the kubelet here, the status reporter (P2 §8), the ReplicaSet controller (P3). Cue: *whenever you're tempted to handle "the event," ask instead "what's the difference between what I want and what is?" and drive that to zero — events become mere hints to recheck, not facts you must not miss.*
 
 **Concept — the three-way diff is plain set arithmetic.** Keys are Pod names:
 ```
@@ -733,6 +760,8 @@ This is our **etcd**. The single most important Phase 2 concept lives here.
 ```
 This is lost-update prevention *without locks*: a read-modify-write that fails loudly instead of silently clobbering. Real K8s does exactly this; the rv is opaque to clients (they just echo it back).
 
+> **⚙ Principle — optimistic concurrency for contended shared state.** Two ways to stop concurrent writers from clobbering each other: *pessimistic* (take a lock, block everyone else) or *optimistic* (let everyone proceed, attach a version, reject the write whose version is stale, make the loser retry). Optimistic wins when conflicts are *rare* — no lock to hold, no deadlocks, no blocking, and it works across a network where you can't hold a lock anyway. The cost is that callers must handle a Conflict and retry (P2 §8). Cue: *for shared state with infrequent contention — especially over a network — prefer a compare-and-set on a version token over a lock; reserve locks for genuinely hot, in-process contention.*
+
 **Concept — the atomic transaction, in code.** The rv-check and counter-bump must be one indivisible step, or two writers could both pass the check before either bumps. `sled`'s `transaction(closure)` gives that (`replace_spec`):
 ```rust
 let updated = self.db.transaction(|tx| {
@@ -927,6 +956,8 @@ This watch-for-latency + resync-for-safety pairing *is* the K8s informer pattern
 ```
 This is how a real kubelet survives its own restart without disturbing running Pods: it adopts what's alive and reconciles, instead of assuming a blank slate. The new primitives are `RecoveredContainer` (on the `RuntimeClient` trait, via `recover_all`) and `PodSandbox::from_recovered`, which reconstructs the same `{pod}__pause` id and app-name list the original `create()` produced, so ids line up for future calls. Pinned by `from_recovered_populates_fields_without_touching_runtime`.
 
+> **⚙ Principle — design the failure path first, not last.** The "developer" version of a kubelet assumes a clean boot and only handles the happy path; the "engineer" version asks *"what's already running when I start, and what happened to the thing I was managing when I died?"* — and treats restart-into-existing-state as the normal case, not an exception. Notice the pattern is *the same reconcile loop again*: observe actual (live containers), compare to desired (apiserver Pods), converge (reattach / create / destroy-orphan). Level-triggered reconciliation is *why* crash recovery is almost free here — there's no special "recovery mode," just the normal loop run against whatever state it finds. Cue: *for any long-lived process, ask "what does correct behavior look like after a crash mid-operation?" before you write the happy path — and prefer a design where recovery is just the steady-state loop meeting reality, not a separate codepath.*
+
 **Gotcha — `RuntimeClient` grew `recover_all`.** Adding a trait method means every impl must provide it. `YoukiRuntime` walks the state dir for real; `MockRuntime` returns an empty `Vec`, so the Phase 1 mock-based reconciler/sandbox tests still pass unchanged (they never recover).
 
 **Resolved since first draft.** The kubelet entrypoint is now migrated (see §8) — `Reconciler::new` is fed an `Arc<Client>`, and `cargo check --all-targets` is clean. This section's "reads desired state" half is complete; §8 adds the "reports observed state back" half.
@@ -1087,3 +1118,144 @@ A working two-tier control plane. Desired state now lives in a persistent, HTTP-
 What we explicitly did NOT build (deferred): real container start timestamps and exit codes (status carries placeholders), graceful watch-stream close on apiserver shutdown, image pull (still busybox-only), probes, volumes/env/limits. And there's still only one node.
 
 **Phase 3 (next) is controllers.** With a watchable API in place, the natural next layer is the controller pattern: a separate process that watches a higher-level resource (ReplicaSet) and reconciles Pods to match a desired count — recreating one when it's deleted. It's the same list-watch-reconcile loop the kubelet already runs, but operating on *Pods as its output* instead of containers. The watch API we just built is exactly what makes it possible.
+
+---
+
+# Phase 3 — Controllers: the ReplicaSet controller
+
+**What a controller is, and why it's the heart of K8s.** A *controller* is an independent process that watches a high-level resource and drives reality toward it. A **ReplicaSet** says "I want N Pods matching this label selector"; the ReplicaSet controller makes that true — creating Pods when there are too few, deleting when too many, recreating one the instant it's deleted. It is the *same* list-watch-reconcile loop the kubelet runs (P2 §7), but its "output" is **API objects (Pods)**, not containers. This shape — watch a desired-state resource, reconcile the world to match — is the **single most important pattern in Kubernetes**: every Deployment, Job, StatefulSet, and every custom operator is just another controller of this form. Build this one well and you understand all of them.
+
+```
+   ┌── apiserver ──┐   watch RS + watch Pods    ┌──── controller-manager ────┐
+   │ ReplicaSet    │ ─────────────────────────► │ informers → work queue      │
+   │ Pods          │ ◄───────────────────────── │ worker: reconcile(rs_name)  │
+   └───────────────┘   create / delete Pods      └─────────────────────────────┘
+        the controller is just another CLIENT of the apiserver (P2 §6) — no special access
+```
+
+New this phase: `replicaset.rs` (schema), a *generalized* `ResourceStore<T>`, `ObjectMeta` gains labels + ownerReferences, and a whole `controller/` module (`workqueue`, `replicaset`, `manager`) plus a `controller-manager` binary. Construction order below.
+
+## 1. Generalize the store to `ResourceStore<T>` + the ReplicaSet schema (`storage.rs`, `replicaset.rs`, `meta.rs`)
+
+Phase 2's store was hard-wired to `Pod`. A second resource (ReplicaSet) needs the *exact same* machinery — JSON-in-sled, resourceVersion, optimistic concurrency, watch events. So we made the store generic over a trait, and pointed `PodStore` at it:
+```rust
+pub trait ResourceMeta: Clone + Serialize + DeserializeOwned + Send + Sync + 'static {
+    const KIND_PREFIX: &'static str;          // "pods/" or "replicasets/" — the sled key namespace
+    fn meta(&self) -> &ObjectMeta;            // every resource embeds the shared metadata...
+    fn meta_mut(&mut self) -> &mut ObjectMeta;// ...and exposes it through these
+    fn clear_status(&mut self) {}             // create strips status (default: no-op)
+    fn inherit_status(&mut self, _cur: &Self) {} // spec-replace preserves status
+}
+
+pub struct ResourceStore<T: ResourceMeta> { db: sled::Db, rv_tree: sled::Tree, watch_tx: broadcast::Sender<WatchEvent<T>> }
+pub type PodStore = ResourceStore<Pod>;       // the alias: old call sites keep compiling
+```
+> **⚙ Principle — defer generalization until the second case (rule of three).** We did *not* build a generic store in Phase 2, even though we "knew" more resources were coming. Speculative generality is a classic trap: you abstract over a future you're guessing at and get the shape wrong. Waiting until ReplicaSet actually arrived meant the trait was shaped by *two real cases*, so `ResourceMeta` carves exactly the seams both need (`KIND_PREFIX`, status hooks) and nothing speculative. Cue: *generalize when a second concrete user forces it, not when you anticipate one.*
+>
+> **⚙ Principle — refactor without churn via type aliases.** `pub type PodStore = ResourceStore<Pod>;` means every `PodStore::...` call site, every test, every handler kept compiling untouched while the type underneath became generic. Cue: *when you generalize an implementation, keep the old name as an alias so the blast radius of the refactor stays near zero.*
+
+The **ReplicaSet schema** (`replicaset.rs`) is "desired count + how to find my Pods + the Pod blueprint":
+```rust
+pub struct ReplicaSetSpec {
+    pub replicas: u32,
+    pub selector: LabelSelector,        // matchLabels — how the RS identifies its Pods
+    pub template: PodTemplateSpec,      // the Pod blueprint to stamp out (labels + spec only)
+}
+```
+> **⚙ Principle — couple by data, not by reference.** An RS doesn't hold a list of Pod IDs; it holds a *label selector* and finds its Pods by querying. This is loose coupling: Pods can be created, adopted, or deleted by anyone, and the RS re-derives its set each reconcile. Cue: *prefer "describe what I want and query for it" over "hold hard pointers to specific instances" — the former self-heals, the latter goes stale.*
+
+## 2. `ObjectMeta` gains labels + ownerReferences (`meta.rs`)
+
+Two fields turn flat objects into a graph the controller can navigate:
+```rust
+pub struct ObjectMeta {
+    /* name, uid, resourceVersion, generation, creationTimestamp ... */
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,        // selectors match on these
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owner_references: Vec<OwnerReference>,    // "who controls me"
+}
+pub struct OwnerReference { /* apiVersion, kind, name, uid, */ pub controller: bool } // exactly one controller:true
+```
+> **⚙ Principle — model identity and ownership explicitly.** `labels` answer "which set am I part of?" (a *many-to-many, value-based* relationship); `ownerReferences` answer "who is responsible for my lifecycle?" (a *direct, identity-based* link, with `controller: true` marking the one managing owner). Keeping these separate is deliberate: selectors are for *discovery/grouping*, owner refs are for *lifecycle/cascade-delete*. Cue: *don't conflate "is similar to / grouped with" (labels) with "is owned by / cascades from" (references) — they have different change rates and different consumers.*
+>
+> **⚙ Principle — make the wire format forward/backward compatible.** `skip_serializing_if` omits empty labels/owners entirely, so JSON written before these fields existed still deserializes, and the common no-labels case stays clean. `BTreeMap` (not `HashMap`) gives deterministic key order, so the same labels always serialize to the same bytes. Cue: *additive schema changes should be invisible to old data; deterministic serialization avoids spurious diffs.*
+
+## 3. The work queue (`controller/workqueue.rs`)
+
+Controllers never reconcile straight from watch events. They enqueue a **key** (a resource *name*), and a worker drains keys. The queue is three sets working together:
+```rust
+struct Inner {
+    queue: VecDeque<String>,      // ready to hand to a worker, FIFO
+    dirty: HashSet<String>,       // needs processing (queued OR in-flight) — the DEDUP set
+    processing: HashSet<String>,  // currently checked out by a worker
+}
+// add(key):    if already dirty → drop it (dedup). else mark dirty; if not processing, push to queue.
+// get()  → key: pop from queue, remove from dirty, insert into processing.
+// done(key):   remove from processing; if it went dirty again while in flight, re-queue it ONCE.
+```
+> **⚙ Principle — decouple producers from consumers with a queue.** Watch events (producers) arrive in unpredictable bursts; reconciles (consumer) take variable time. A queue between them absorbs the burst and lets each side run at its own rate. Cue: *whenever arrival rate ≠ processing rate, put a buffer between them.*
+>
+> **⚙ Principle — dedup on identity, carry no payload.** The queue holds *names*, not event data. Ten events for `web` collapse to one `web` key → one reconcile that reads *current* full state. This is what makes the controller level-triggered (§4) and cheap under load. Cue: *enqueue "what changed" (a key), not "what happened" (an event); then re-derive the truth when you process it.*
+>
+> **⚙ Principle — make concurrency invariants explicit in the data model.** The three-set design guarantees, by construction, "never two workers on one key" and "a key re-added mid-flight is reprocessed exactly once, never lost." Those are the hard bugs in concurrent systems, and they're prevented here by *structure*, not by careful timing. Cue: *encode your concurrency guarantees in the types/state, so they hold regardless of scheduling.* (Pinned by `readd_during_processing_requeues_once_on_done`.)
+
+A separate `RateLimiter` (per-key failure count) + `backoff_for(n)` give **exponential backoff on reconcile errors** — the same saturating-shift math as the kubelet's CrashLoopBackOff (P1 §10), kept independent of queue position.
+
+## 4. The reconcile function (`controller/replicaset.rs`)
+
+The heart. Keyed by RS name, it re-reads full state and converges:
+```rust
+pub async fn reconcile(rs_name: &str, client: &Client) -> Result<()> {
+    let rs = match client.get_replicaset(rs_name).await? {
+        Some(rs) => rs,
+        None => return cascade_delete(rs_name, client).await,   // RS gone → delete its Pods
+    };
+    // gather owned Pods, adopting matching orphans
+    let mut owned = /* list_pods filtered by ownerRef, + adopt() any matching unowned Pod */;
+    let desired = rs.spec.replicas as usize;
+    if owned.len() < desired {                 // deficit → create from template
+        for _ in 0..(desired - owned.len()) { client.create_pod(&pod_from_template(&rs)).await?; }
+    } else if owned.len() > desired {          // surplus → delete OLDEST first
+        owned.sort_by(|a,b| a.meta.creation_timestamp.cmp(&b.meta.creation_timestamp));
+        for pod in owned.iter().take(owned.len() - desired) { client.delete_pod(...).await?; }
+    }
+    update_status(rs_name, &rs, client).await  // recompute + PUT status — only if changed
+}
+```
+> **⚙ Principle — level-triggered reconciliation.** `reconcile` doesn't ask "what event fired?"; it reads *current* desired (`rs.spec.replicas`) and *current* actual (owned Pods) and computes the difference. So it doesn't matter whether it was triggered by a watch event, a 30s resync, or a retry — the outcome is identical, and a missed event just means the next trigger fixes it. Cue: *make the unit of work "observe everything, converge," not "handle this delta" — it's the difference between a system that self-heals and one that drifts.*
+>
+> **⚙ Principle — idempotency is what makes retries safe.** Run `reconcile("web")` once or five times against `replicas: 3` and you get exactly 3 Pods (pinned by `reconcile_is_idempotent`). Because re-running is harmless, the controller can trigger aggressively and retry on error without fear of double-creating. Cue: *if an operation is idempotent, you get retry-safety and trigger-freedom for free; design for it.*
+>
+> **⚙ Principle — guard invariants others depend on (don't steal).** Adoption only takes a Pod that matches the selector **and has no controller owner yet** — a Pod owned by *another* RS is off-limits (`reconcile_does_not_adopt_pod_owned_by_another_rs`). Cue: *before mutating shared state, check the invariants other actors rely on; "it matches my filter" is not the same as "it's mine to take."*
+>
+> **⚙ Principle — break feedback loops with a change check.** `update_status` PUTs only when the computed status *differs* from the stored one. Without that guard, the status write would emit an RS MODIFIED watch event → re-enqueue → reconcile → identical status write → event → … forever. Cue: *whenever your write produces an event that re-triggers your own logic, gate the write on "did anything actually change?" — this is the #1 way reactive systems spin.*
+>
+> **⚙ Principle — prefer deterministic behavior.** Scale-down deletes the *oldest* Pods first, not a random set. Deterministic choices make the system predictable, debuggable, and testable. Cue: *when you must pick among equivalent items, pick by a stable rule (age, name) rather than leaving it to map/iteration order.*
+
+## 5. The manager: composing the loops (`controller/manager.rs`)
+
+Four tasks, all funneling RS *names* into one queue; one worker drains it:
+```rust
+tokio::spawn(rs_informer(...));    // watch ReplicaSets → enqueue the RS's own name
+tokio::spawn(pod_informer(...));   // watch Pods → map each to its owning RS (via ownerRef) → enqueue that
+tokio::spawn(resync_loop(...));    // every 30s: enqueue EVERY RS (safety net for missed events)
+tokio::spawn(worker_loop(...));    // get() a key → reconcile → on Ok forget+done; on Err done + add_after(backoff)
+```
+> **⚙ Principle — watch for latency, resync for safety.** The informers react in milliseconds; the 30s resync is the backstop that heals anything the watches dropped (a connection blip, a missed event). Neither alone is enough — watch is fast but lossy, resync is reliable but slow. Cue: *for eventually-consistent reactive systems, pair a fast-but-unreliable signal with a slow-but-complete sweep.* (Same shape as the kubelet's informer, P2 §7.)
+>
+> **⚙ Principle — funnel many event sources to one unit of work.** A *Pod* event and an *RS* event both reduce to "reconcile this RS name." The pod_informer maps a Pod back to its owner via `rs_key_for_pod` (reads the ownerRef) before enqueuing. So the worker has exactly one kind of job, and all the triggering complexity lives at the edges. Cue: *normalize diverse triggers into a single canonical work item as early as possible.*
+>
+> **⚙ Principle — design for disconnection.** Each informer wraps its watch in a reconnect loop: on stream error or close, it logs, waits `RECONNECT_DELAY`, and re-opens — and the next resync re-seeds anything missed during the gap. Cue: *any network stream WILL drop; the question is whether your code treats reconnect as the normal case (it should) or a crash (it shouldn't).*
+
+This is exactly how you'd kill a Pod and watch it come back: `delete_pod` → apiserver emits DELETED (carrying ownerRefs) → pod_informer maps it to the RS → enqueue → worker reconciles → recreates the missing Pod. Pinned end-to-end by `controller_recreates_a_deleted_pod` (apiserver + full manager in-process).
+
+## Phase 3 wrap — what this earned us
+
+The **controller pattern**, the mechanism that makes Kubernetes *extensible*: an independent process that watches a desired-state resource and reconciles the world to match, built entirely as an ordinary apiserver client (no privileged access). Concretely: a generic `ResourceStore<T>` serving multiple kinds, label selectors + ownerReferences turning flat objects into an ownership graph, a deduplicating work queue, and a level-triggered reconcile that creates/deletes/adopts Pods and self-heals on deletion.
+
+But the durable takeaway is the **engineering judgment**, not the K8s trivia. This phase alone demonstrates: defer-generalization (rule of three), refactor-by-alias, couple-by-data, model-ownership-explicitly, decouple-via-queue, level-triggered reconciliation, idempotency-for-retry-safety, guard-others'-invariants, break-feedback-loops, deterministic-behavior, watch-for-latency/resync-for-safety, and design-for-disconnection. Every one of those (see the [Engineering principles index](#engineering-principles-by-example)) transfers to systems that have nothing to do with containers.
+
+What we did NOT build: Deployments (rolling updates over ReplicaSets), multi-controller coordination, leader election (only one controller-manager may run safely today), and real readiness beyond the kubelet's phase report.
+
+**Phase 4 (next) is the scheduler.** Right now a Pod created by the RS controller has no node assignment — in a multi-node world, *something* must decide which kubelet runs it. The scheduler is yet another controller: watch for Pods with no node, score the candidates, write the binding. Same loop, new decision.
