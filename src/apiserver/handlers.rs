@@ -120,6 +120,7 @@ impl IntoResponse for ApiError {
 pub struct ListWatchParams {
     pub watch: Option<bool>,
     pub resource_version: Option<String>,
+    pub field_selector: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -144,12 +145,22 @@ pub async fn list_or_watch_pods(
     State(state): State<AppState>,
     Query(params): Query<ListWatchParams>,
 ) -> Result<Response, ApiError> {
+    let node_filter = parse_node_name_selector(params.field_selector.as_deref());
     if params.watch.unwrap_or(false) {
         let from_rv = parse_rv(params.resource_version.as_deref());
+
+        // One owned closure (captures the Option<String> by move → 'static +
+        // Send). Branching on the captured data rather than picking between two
+        // closure types means a single concrete type, so no Box/dyn needed.
+        let filter = move |p: &Pod| match &node_filter {
+            Some(node) => p.spec.node_name.as_deref() == Some(node.as_str()),
+            None => true,
+        };
+
         // Adapt the WatchEvent stream into a byte stream: each event → JSON +
         // '\n' (NDJSON), which the client line-decodes. `map` transforms each
         // item; errors become io::Errors that terminate the HTTP body.
-        let stream = stream_events(state.store.clone(), from_rv).map(|res| match res {
+        let stream = stream_events(state.store.clone(), from_rv, filter).map(|res| match res {
             Ok(ev) => {
                 let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
                 bytes.push(b'\n');
@@ -171,7 +182,10 @@ pub async fn list_or_watch_pods(
             .map_err(|e| ApiError::Internal(format!("response build: {e}")))?;
         Ok(response)
     } else {
-        let (pods, _rv) = state.store.list()?;
+        let (mut pods, _rv) = state.store.list()?;
+        if let Some(node) = node_filter {
+            pods.retain(|p| p.spec.node_name.as_deref() == Some(node.as_str()));
+        }
         Ok((StatusCode::OK, Json(PodList::new(pods))).into_response())
     }
 }
@@ -301,17 +315,18 @@ pub async fn list_or_watch_replicasets(
 ) -> Result<Response, ApiError> {
     if params.watch.unwrap_or(false) {
         let from_rv = parse_rv(params.resource_version.as_deref());
-        let stream = stream_events(state.rs_store.clone(), from_rv).map(|res| match res {
-            Ok(ev) => {
-                let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
-                bytes.push(b'\n');
-                Ok::<Vec<u8>, std::io::Error>(bytes)
-            }
-            Err(e) => {
-                warn!(error = %e, "watch stream error; closing connection");
-                Err(std::io::Error::other(e.to_string()))
-            }
-        });
+        let stream =
+            stream_events(state.rs_store.clone(), from_rv, |_| true).map(|res| match res {
+                Ok(ev) => {
+                    let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
+                    bytes.push(b'\n');
+                    Ok::<Vec<u8>, std::io::Error>(bytes)
+                }
+                Err(e) => {
+                    warn!(error = %e, "watch stream error; closing connection");
+                    Err(std::io::Error::other(e.to_string()))
+                }
+            });
         let response = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
@@ -391,6 +406,15 @@ fn parse_rv(s: Option<&str>) -> u64 {
     s.and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
+/// Parse the one field selector we support: `spec.nodeName=<value>`.
+/// Returns `Some(node_name)` to filter by, or `None` (no/unsupported selector
+/// → no filtering, which is the safe default).
+fn parse_node_name_selector(field_selector: Option<&str>) -> Option<String> {
+    field_selector?
+        .strip_prefix("spec.nodeName=")
+        .map(|v| v.to_string())
+}
+
 /// Boundary validation: reject malformed input at the HTTP edge with a 400,
 /// before it ever touches the store. Validate at the boundary, trust the core.
 fn validate_pod(pod: &Pod) -> Result<(), ApiError> {
@@ -442,17 +466,18 @@ pub async fn list_or_watch_nodes(
 ) -> Result<Response, ApiError> {
     if params.watch.unwrap_or(false) {
         let from_rv = parse_rv(params.resource_version.as_deref());
-        let stream = stream_events(state.node_store.clone(), from_rv).map(|res| match res {
-            Ok(ev) => {
-                let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
-                bytes.push(b'\n');
-                Ok::<Vec<u8>, std::io::Error>(bytes)
-            }
-            Err(e) => {
-                warn!(error = %e, "node watch stream error; closing connection");
-                Err(std::io::Error::other(e.to_string()))
-            }
-        });
+        let stream =
+            stream_events(state.node_store.clone(), from_rv, |_| true).map(|res| match res {
+                Ok(ev) => {
+                    let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
+                    bytes.push(b'\n');
+                    Ok::<Vec<u8>, std::io::Error>(bytes)
+                }
+                Err(e) => {
+                    warn!(error = %e, "node watch stream error; closing connection");
+                    Err(std::io::Error::other(e.to_string()))
+                }
+            });
         let response = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
@@ -1116,5 +1141,98 @@ mod tests {
             .unwrap();
         // A successful 200 (not 404/405) proves the 4-segment route matched.
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ---- server-side fieldSelector (spec.nodeName) ----
+
+    /// Create a pod already bound to `node` (skips the binding round-trip).
+    fn make_pod_on(name: &str, node: &str) -> Pod {
+        let mut p = make_pod(name);
+        p.spec.node_name = Some(node.into());
+        p
+    }
+
+    /// Pull one watch event within `ms`, unwrapping both the timeout and the
+    /// stream's `Result`. `None` = stream stayed pending (e.g. filtered out).
+    async fn next_within<S>(
+        stream: &mut S,
+        ms: u64,
+    ) -> Option<crate::apiserver::watch::WatchEvent<Pod>>
+    where
+        S: tokio_stream::Stream<
+                Item = Result<
+                    crate::apiserver::watch::WatchEvent<Pod>,
+                    crate::apiserver::watch::WatchError,
+                >,
+            > + Unpin,
+    {
+        tokio::time::timeout(std::time::Duration::from_millis(ms), stream.next())
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.expect("watch event was Err"))
+    }
+
+    #[tokio::test]
+    async fn list_filters_by_node_name() {
+        let (app, store, _, _) = setup_full();
+        store.create(make_pod_on("a", "node-a")).unwrap();
+        store.create(make_pod_on("b", "node-b")).unwrap();
+        store.create(make_pod("c")).unwrap(); // unscheduled (node_name None)
+
+        // Filtered list → only node-a's pod.
+        let res = app
+            .clone()
+            .oneshot(empty_req(
+                Method::GET,
+                "/api/v1/pods?fieldSelector=spec.nodeName=node-a",
+            ))
+            .await
+            .unwrap();
+        let body = body_value(res).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["metadata"]["name"], "a");
+
+        // Unfiltered list → all three.
+        let res = app
+            .oneshot(empty_req(Method::GET, "/api/v1/pods"))
+            .await
+            .unwrap();
+        let body = body_value(res).await;
+        assert_eq!(body["items"].as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn watch_filters_catch_up_and_live_by_node_name() {
+        let (_app, store, _, _) = setup_full();
+        // Pre-existing pods: one on node-a, one on node-b.
+        store.create(make_pod_on("a", "node-a")).unwrap();
+        store.create(make_pod_on("b", "node-b")).unwrap();
+
+        // Watch node-a from rv 0 (catch-up should yield only "a").
+        let node_filter = parse_node_name_selector(Some("spec.nodeName=node-a"));
+        assert_eq!(node_filter.as_deref(), Some("node-a"));
+        let filter = move |p: &Pod| match &node_filter {
+            Some(n) => p.spec.node_name.as_deref() == Some(n.as_str()),
+            None => true,
+        };
+        let stream = stream_events(store.clone(), 0, filter);
+        tokio::pin!(stream);
+
+        // Catch-up: exactly one event, for "a".
+        let ev = next_within(&mut stream, 100).await.expect("catch-up ev");
+        assert_eq!(ev.object.metadata.name, "a");
+        assert!(next_within(&mut stream, 50).await.is_none(), "b must be filtered out");
+
+        // Live: a new node-a pod is delivered; a node-b pod is not.
+        let store_w = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            store_w.create(make_pod_on("c", "node-b")).unwrap(); // filtered out
+            store_w.create(make_pod_on("d", "node-a")).unwrap(); // delivered
+        });
+        let ev = next_within(&mut stream, 500).await.expect("live ev");
+        assert_eq!(ev.object.metadata.name, "d", "only the node-a live pod arrives");
     }
 }

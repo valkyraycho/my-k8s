@@ -49,10 +49,15 @@ pub enum WatchError {
 /// `list()` snapshot: any write landing in between is then buffered in the
 /// broadcast channel and replayed live (deduped by the rv filter), so nothing
 /// slips through the gap.
-pub fn stream_events<T: ResourceMeta>(
+pub fn stream_events<T, F>(
     store: Arc<ResourceStore<T>>,
     from_rv: u64,
-) -> impl Stream<Item = Result<WatchEvent<T>, WatchError>> {
+    filter: F,
+) -> impl Stream<Item = Result<WatchEvent<T>, WatchError>>
+where
+    T: ResourceMeta,
+    F: Fn(&T) -> bool + Send + 'static,
+{
     // `try_stream!` lets us write a generator as straight-line async with
     // `yield`, instead of hand-implementing `Stream::poll_next`. Inside it, `?`
     // YIELDS the error as the final item and ends the stream.
@@ -62,7 +67,7 @@ pub fn stream_events<T: ResourceMeta>(
 
         // Catch-up: replay everything newer than the client's resume point.
         for obj in snapshot {
-            if resource_rv(&obj) > from_rv {
+            if resource_rv(&obj) > from_rv && filter(&obj) {
                 yield WatchEvent {
                     event_type: WatchEventType::Added,
                     object: obj,
@@ -75,10 +80,10 @@ pub fn stream_events<T: ResourceMeta>(
         loop {
             match rx.recv().await {
                 Ok(ev) => {
-                    if resource_rv(&ev.object) > snapshot_rv {
+                    if resource_rv(&ev.object) > snapshot_rv && filter(&ev.object) {
                         yield ev
                     }
-                }
+            }
                 // Fell >channel-capacity behind: we can't silently skip (the
                 // client's cache would desync forever), so END the stream with
                 // an error → HTTP 410 → client re-lists. `?` does the terminate.
@@ -151,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn empty_store_catch_up_emits_nothing() {
         let store = store();
-        let stream = stream_events(store, 0);
+        let stream = stream_events(store, 0, |_| true);
         tokio::pin!(stream);
 
         // Empty catch-up → stream parks at rx.recv().await; we time out cleanly.
@@ -165,7 +170,7 @@ mod tests {
         store.create(make_pod("b")).unwrap();
         store.create(make_pod("c")).unwrap();
 
-        let stream = stream_events(store.clone(), 0);
+        let stream = stream_events(store.clone(), 0, |_| true);
         tokio::pin!(stream);
 
         let mut events = Vec::new();
@@ -198,7 +203,7 @@ mod tests {
         store.create(make_pod("c")).unwrap(); // rv=3
 
         // from_rv=2 → only "c" (rv=3) should be emitted as catch-up.
-        let stream = stream_events(store.clone(), 2);
+        let stream = stream_events(store.clone(), 2, |_| true);
         tokio::pin!(stream);
 
         let ev = try_next(&mut stream, 100)
@@ -215,7 +220,7 @@ mod tests {
         let store = store();
         store.create(make_pod("a")).unwrap(); // rv=1
 
-        let stream = stream_events(store.clone(), 0);
+        let stream = stream_events(store.clone(), 0, |_| true);
         tokio::pin!(stream);
 
         // Catch-up: ADDED for "a"
@@ -248,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn lagged_receiver_terminates_stream_with_error() {
         let store = store();
-        let stream = stream_events(store.clone(), 0);
+        let stream = stream_events(store.clone(), 0, |_| true);
         tokio::pin!(stream);
 
         // First poll: empty catch-up, stream parks at rx.recv().await.

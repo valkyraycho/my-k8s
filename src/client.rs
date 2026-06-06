@@ -2,16 +2,21 @@ use std::pin::Pin;
 
 use reqwest::StatusCode;
 
+use serde::Serialize;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::{
     codec::{FramedRead, LinesCodec},
     io::StreamReader,
 };
 
-use crate::pod::{Pod, PodStatus};
 use crate::{
     apiserver::watch::WatchEvent,
+    node::NodeStatus,
     replicaset::{ReplicaSet, ReplicaSetStatus},
+};
+use crate::{
+    node::Node,
+    pod::{Pod, PodStatus},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +102,68 @@ impl Client {
             None => "/api/v1/pods?watch=true".to_string(),
         };
         self.watch_resource(&path).await
+    }
+
+    pub async fn list_pods_on_node(&self, node_name: &str) -> Result<Vec<Pod>> {
+        self.list_resource(&format!(
+            "/api/v1/pods?fieldSelector=spec.nodeName={node_name}"
+        ))
+        .await
+    }
+
+    pub async fn watch_pods_on_node(
+        &self,
+        node_name: &str,
+        from_rv: Option<&str>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<Pod>>> + Send>>> {
+        let path = match from_rv {
+            Some(rv) => format!(
+                "/api/v1/pods?watch=true&fieldSelector=spec.nodeName={node_name}&resourceVersion={rv}"
+            ),
+            None => format!("/api/v1/pods?watch=true&fieldSelector=spec.nodeName={node_name}"),
+        };
+        self.watch_resource(&path).await
+    }
+
+    pub async fn bind_pod(&self, pod_name: &str, node_name: &str) -> Result<Pod> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Binding {
+            node_name: String,
+        }
+
+        self.create_resource(
+            &format!("/api/v1/pods/{pod_name}/binding"),
+            &Binding {
+                node_name: node_name.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn list_nodes(&self) -> Result<Vec<Node>> {
+        self.list_resource("/api/v1/nodes").await
+    }
+
+    pub async fn get_node(&self, name: &str) -> Result<Option<Node>> {
+        self.get_resource(&format!("/api/v1/nodes/{name}")).await
+    }
+
+    pub async fn create_node(&self, node: &Node) -> Result<Node> {
+        self.create_resource("/api/v1/nodes", node).await
+    }
+
+    pub async fn replace_node_status(
+        &self,
+        name: &str,
+        status: &NodeStatus,
+        rv: &str,
+    ) -> Result<Node> {
+        self.put_resource(
+            &format!("/api/v1/nodes/{name}/status?resourceVersion={rv}"),
+            status,
+        )
+        .await
     }
 
     async fn list_resource<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Vec<T>> {
@@ -269,6 +336,7 @@ mod tests {
         routes::router,
         storage::{PodStore, ResourceStore},
     };
+    use crate::node::{Node, NodeSpec, NodeStatus};
     use crate::pod::{Container, Pod, PodMetadata, PodPhase, PodSpec};
     use crate::replicaset::ReplicaSet;
 
@@ -281,7 +349,8 @@ mod tests {
             .open()
             .expect("temp db");
         let store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
-        let rs_store = Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
+        let rs_store =
+            Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
         let node_store =
             Arc::new(ResourceStore::<crate::node::Node>::from_db(db).expect("node store"));
         let app = router(AppState {
@@ -423,7 +492,9 @@ mod tests {
     // ---- ReplicaSet client methods (over the generic helpers) ----
 
     fn make_rs(name: &str, replicas: u32) -> ReplicaSet {
-        use crate::replicaset::{LabelSelector, PodTemplateSpec, ReplicaSetSpec, TemplateObjectMeta};
+        use crate::replicaset::{
+            LabelSelector, PodTemplateSpec, ReplicaSetSpec, TemplateObjectMeta,
+        };
         let mut selector = LabelSelector::default();
         selector.match_labels.insert("app".into(), name.into());
         let mut tmpl = TemplateObjectMeta::default();
@@ -440,7 +511,10 @@ mod tests {
                 selector,
                 template: PodTemplateSpec {
                     metadata: tmpl,
-                    spec: PodSpec { containers: vec![], node_name: None },
+                    spec: PodSpec {
+                        containers: vec![],
+                        node_name: None,
+                    },
                 },
             },
             status: None,
@@ -501,5 +575,86 @@ mod tests {
             .expect("event was Err");
         assert_eq!(event.object.metadata.name, "web");
         assert_eq!(event.object.spec.replicas, 1);
+    }
+
+    // ---- node binding + node-filtered access + Node CRUD ----
+
+    fn make_node(name: &str) -> Node {
+        Node {
+            api_version: "v1".into(),
+            kind: "Node".into(),
+            metadata: PodMetadata {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: NodeSpec::default(),
+            status: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_pod_sets_node_name() {
+        let (client, _) = spawn_test_apiserver().await;
+        client.create_pod(&make_pod("web")).await.unwrap();
+        let bound = client.bind_pod("web", "node-a").await.unwrap();
+        assert_eq!(bound.spec.node_name.as_deref(), Some("node-a"));
+    }
+
+    #[tokio::test]
+    async fn list_pods_on_node_filters() {
+        let (client, _) = spawn_test_apiserver().await;
+        client.create_pod(&make_pod("a")).await.unwrap();
+        client.create_pod(&make_pod("b")).await.unwrap();
+        client.bind_pod("a", "node-a").await.unwrap();
+        client.bind_pod("b", "node-b").await.unwrap();
+
+        let on_a = client.list_pods_on_node("node-a").await.unwrap();
+        assert_eq!(on_a.len(), 1);
+        assert_eq!(on_a[0].metadata.name, "a");
+        assert_eq!(client.list_pods().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn node_create_get_list_and_status() {
+        let (client, _) = spawn_test_apiserver().await;
+        let n = client.create_node(&make_node("node-a")).await.unwrap();
+        assert_eq!(n.metadata.name, "node-a");
+        assert!(client.get_node("node-a").await.unwrap().is_some());
+        assert!(client.get_node("nope").await.unwrap().is_none());
+        assert_eq!(client.list_nodes().await.unwrap().len(), 1);
+
+        let rv = n.metadata.resource_version.unwrap();
+        let status = NodeStatus {
+            ready: true,
+            last_heartbeat_time: Some("2026-06-04T10:00:00Z".into()),
+        };
+        let updated = client
+            .replace_node_status("node-a", &status, &rv)
+            .await
+            .unwrap();
+        assert!(updated.status.unwrap().ready);
+    }
+
+    #[tokio::test]
+    async fn watch_pods_on_node_delivers_only_matching() {
+        let (client, _) = spawn_test_apiserver().await;
+        let mut stream = client.watch_pods_on_node("node-a", Some("0")).await.unwrap();
+
+        let c2 = Client::new(client.base_url.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.create_pod(&make_pod("a")).await.unwrap();
+            c2.bind_pod("a", "node-b").await.unwrap(); // filtered out
+            c2.create_pod(&make_pod("b")).await.unwrap();
+            c2.bind_pod("b", "node-a").await.unwrap(); // delivered
+        });
+
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("event was Err");
+        assert_eq!(event.object.metadata.name, "b");
+        assert_eq!(event.object.spec.node_name.as_deref(), Some("node-a"));
     }
 }
