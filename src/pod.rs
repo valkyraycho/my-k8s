@@ -325,7 +325,10 @@ spec:
         };
         let json = serde_json::to_string(&with_ip).unwrap();
         assert!(json.contains(r#""podIP":"10.244.2.7""#), "got: {json}");
-        assert!(!json.contains("podIp"), "must not camelCase to podIp: {json}");
+        assert!(
+            !json.contains("podIp"),
+            "must not camelCase to podIp: {json}"
+        );
 
         let parsed: PodStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, with_ip);

@@ -31,6 +31,7 @@ pub struct PodSandbox {
     app_containers: Vec<String>,
     pods_dir: PathBuf,
     rootfs_base: PathBuf,
+    pod_ip: Option<String>,
 }
 
 impl PodSandbox {
@@ -43,6 +44,7 @@ impl PodSandbox {
             app_containers: Vec::new(),
             pods_dir,
             rootfs_base,
+            pod_ip: None,
         }
     }
 
@@ -57,6 +59,7 @@ impl PodSandbox {
         app_container_names: Vec<String>,
         pods_dir: PathBuf,
         rootfs_base: PathBuf,
+        pod_ip: Option<String>,
     ) -> Self {
         let pause_id = format!("{pod_name}__pause");
         Self {
@@ -66,6 +69,7 @@ impl PodSandbox {
             app_containers: app_container_names,
             pods_dir,
             rootfs_base,
+            pod_ip,
         }
     }
 
@@ -75,6 +79,10 @@ impl PodSandbox {
 
     pub fn pause_pid(&self) -> Option<u32> {
         self.pause_pid
+    }
+
+    pub fn pod_ip(&self) -> Option<&str> {
+        self.pod_ip.as_deref()
     }
 
     pub fn app_container_names(&self) -> &[String] {
@@ -89,7 +97,11 @@ impl PodSandbox {
     /// `YoukiRuntime` and the test `MockRuntime` share this exact code path —
     /// monomorphized per type, no vtable. Pause MUST come up first: it mints
     /// the namespaces every later container joins, and we must capture its pid.
-    pub fn create<R: RuntimeClient>(&mut self, runtime: &mut R) -> Result<()> {
+    pub fn create<R: RuntimeClient>(
+        &mut self,
+        runtime: &mut R,
+        pod_ip: Option<String>,
+    ) -> Result<()> {
         let pause_container = pause_container_spec();
         let pause_bundle_dir = self.bundle_dir_for(&pause_container.name);
         // `None` share-pid → the pause creates fresh namespaces (see bundle.rs).
@@ -111,12 +123,20 @@ impl PodSandbox {
             .context("get pause container pid")?
             .ok_or_else(|| anyhow::anyhow!("pause container pid not found"))?;
         self.pause_pid = Some(pid);
+        self.pod_ip = pod_ip;
 
-        // `#[cfg(not(test))]`: real loopback setup shells out to `nsenter`,
-        // which needs root + a real netns. Tests run without either, so this
-        // line is compiled OUT of test builds (the mock path skips networking).
+        // Networking shells out to `ip`/`nsenter` (needs root + a real netns),
+        // so it's compiled OUT of test builds. With an IP → full veth+bridge
+        // wiring; without → loopback only (a pod created before IPAM assigns it
+        // an address). Match on the stored value via `as_deref` (Option<String>
+        // → Option<&str>) so we borrow rather than move `self.pod_ip`.
         #[cfg(not(test))]
-        setup_pod_network(pid).context("configure pod network")?;
+        match self.pod_ip.as_deref() {
+            Some(ip) => {
+                setup_pod_network(pid, &self.pod_name, ip).context("configure pod network")?
+            }
+            None => loopback_only(pid).context("configure loopback")?,
+        }
 
         Ok(())
     }
@@ -227,7 +247,18 @@ impl PodSandbox {
         let pod_dir = self.pods_dir.join(&self.pod_name);
         let _ = std::fs::remove_dir_all(&pod_dir);
 
+        // Tear down the host end of the veth. The peer (eth0) dies with the
+        // pause netns, but the host end can linger on the bridge, so delete it
+        // explicitly. Best-effort (`let _`): a missing link is fine. The name is
+        // recomputed from the pod name — deterministic, so it matches what
+        // `create` made even across a kubelet restart.
+        #[cfg(not(test))]
+        {
+            let _ = run(&["ip", "link", "del", &host_veth_name(&self.pod_name)]);
+        }
+
         self.pause_pid = None;
+        self.pod_ip = None;
         Ok(())
     }
 
@@ -248,34 +279,155 @@ fn pause_container_spec() -> Container {
     }
 }
 
-/// Bring up the loopback interface inside a pod's network namespace.
-/// Runs from the host (which has CAP_NET_ADMIN) via nsenter — avoids
-/// granting CAP_NET_ADMIN to the pause container itself.
-///
-/// Phase 1 stand-in for the CNI `loopback` plugin.
+// The cluster pod CIDR is 10.244.0.0/16; `mykube0` is the one shared host
+// bridge every pod's veth plugs into, and .0.1 is its gateway. A /16 on the
+// bridge means all pods (across every per-node /24) sit on ONE L2 segment —
+// that's what makes cross-(logical-)node pod-to-pod traffic work with no routing.
+const BRIDGE_NAME: &str = "mykube0";
+const BRIDGE_GATEWAY: &str = "10.244.0.1";
+const BRIDGE_CIDR: &str = "10.244.0.1/16";
+
+/// Idempotent host bridge setup, run once by the kubelet at startup. Multiple
+/// kubelets share ONE host, so the first creates `mykube0` and the rest find it
+/// present — `ip`'s "File exists" is success, not failure (`run_tolerate`).
 #[cfg(not(test))]
-fn setup_pod_network(pause_pid: u32) -> anyhow::Result<()> {
-    let output = std::process::Command::new("nsenter")
-        .args([
-            "-t",
-            &pause_pid.to_string(),
-            "-n",
-            "ip",
-            "link",
-            "set",
-            "lo",
-            "up",
-        ])
+pub fn ensure_bridge() -> anyhow::Result<()> {
+    run_tolerate(
+        &["ip", "link", "add", BRIDGE_NAME, "type", "bridge"],
+        "File exists",
+    )?;
+    run_tolerate(
+        &["ip", "addr", "add", BRIDGE_CIDR, "dev", BRIDGE_NAME],
+        "File exists",
+    )?;
+    run(&["ip", "link", "set", BRIDGE_NAME, "up"])?;
+    // Pods route out via the bridge gateway; forwarding must be enabled.
+    run(&["sysctl", "-w", "net.ipv4.ip_forward=1"])?;
+    Ok(())
+}
+
+/// Test stub: the reconciler calls `ensure_bridge` unconditionally, but tests
+/// have no root/netns. A no-op keeps the reconciler's test build linking.
+#[cfg(test)]
+pub fn ensure_bridge() -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Wire a pod's netns into `mykube0`: create a veth pair (a virtual cable),
+/// put the host end on the bridge, move the peer end into the pause netns as
+/// `eth0` with `pod_ip`, then default-route via the gateway. Run from the host
+/// (which holds CAP_NET_ADMIN) via `nsenter` for the in-namespace steps.
+#[cfg(not(test))]
+fn setup_pod_network(pause_pid: u32, pod_name: &str, pod_ip: &str) -> anyhow::Result<()> {
+    let host_veth = host_veth_name(pod_name);
+    let peer = peer_veth_name(pod_name);
+    let pid = pause_pid.to_string();
+
+    // Create the cable, then attach the host end to the bridge and bring it up.
+    run(&[
+        "ip", "link", "add", &host_veth, "type", "veth", "peer", "name", &peer,
+    ])?;
+    run(&["ip", "link", "set", &host_veth, "master", BRIDGE_NAME])?;
+    run(&["ip", "link", "set", &host_veth, "up"])?;
+    // Move the peer end INTO the pod's network namespace (targeted by pause PID).
+    run(&["ip", "link", "set", &peer, "netns", &pid])?;
+    // Inside the netns: rename to eth0 (only after the move), address it /16 so
+    // it shares the cluster L2, bring eth0 + lo up, default route via the gw.
+    nsenter(&pid, &["ip", "link", "set", &peer, "name", "eth0"])?;
+    nsenter(
+        &pid,
+        &["ip", "addr", "add", &format!("{pod_ip}/16"), "dev", "eth0"],
+    )?;
+    nsenter(&pid, &["ip", "link", "set", "eth0", "up"])?;
+    nsenter(&pid, &["ip", "link", "set", "lo", "up"])?;
+    nsenter(
+        &pid,
+        &["ip", "route", "add", "default", "via", BRIDGE_GATEWAY],
+    )?;
+    Ok(())
+}
+
+/// Loopback-only setup (the Phase-1 behavior) for a pod with no IP yet.
+#[cfg(not(test))]
+fn loopback_only(pause_pid: u32) -> anyhow::Result<()> {
+    nsenter(&pause_pid.to_string(), &["ip", "link", "set", "lo", "up"])
+}
+
+/// Run `args[0]` with the rest as arguments; error (with captured stderr) on a
+/// non-zero exit. Taking `&[&str]` lets call sites read like shell lines.
+#[cfg(not(test))]
+fn run(args: &[&str]) -> anyhow::Result<()> {
+    let output = std::process::Command::new(args[0])
+        .args(&args[1..])
         .output()
-        .context("invoking `nsenter ... ip link set lo up`")?;
+        .with_context(|| format!("running {args:?}"))?;
     if !output.status.success() {
         anyhow::bail!(
-            "loopback setup failed: status={} stderr={}",
+            "command {args:?} failed: status={} stderr={}",
             output.status,
             String::from_utf8_lossy(&output.stderr).trim(),
         );
     }
     Ok(())
+}
+
+/// Like `run`, but treats a failure whose stderr contains `tolerate` as success
+/// — used for idempotent setup (e.g. `ip link add` returns "File exists" when
+/// the bridge is already there). String-matching is fragile in general, but
+/// `ip`'s wording is stable; it's the CLI equivalent of ignoring an EEXIST.
+#[cfg(not(test))]
+fn run_tolerate(args: &[&str], tolerate: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .with_context(|| format!("running {args:?}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains(tolerate) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "command {args:?} failed: status={} stderr={}",
+        output.status,
+        stderr.trim()
+    );
+}
+
+/// Prepend `nsenter -t <pid> -n` so `args` runs INSIDE that PID's network
+/// namespace (the pause container's), even though we invoke it from the host.
+#[cfg(not(test))]
+fn nsenter(pid: &str, args: &[&str]) -> anyhow::Result<()> {
+    let mut full = vec!["nsenter", "-t", pid, "-n"];
+    full.extend_from_slice(args);
+    run(&full)
+}
+
+// Host-side ('v') and in-pod-pre-rename ('p') veth names. Both must be ≤ 15
+// bytes (IFNAMSIZ) and deterministic from the pod name so `destroy` can
+// recompute the host name to delete it.
+fn host_veth_name(pod_name: &str) -> String {
+    veth_name('v', pod_name)
+}
+
+fn peer_veth_name(pod_name: &str) -> String {
+    veth_name('p', pod_name)
+}
+
+/// Derive a ≤15-char interface name: 1-char prefix + 14 hex digits of a hash of
+/// the pod name (pod names can exceed IFNAMSIZ or hold invalid chars). NOTE:
+/// `DefaultHasher::new()` uses FIXED keys (unlike HashMap's randomized
+/// RandomState), so the name is STABLE across process restarts — essential so
+/// `destroy` after a kubelet restart computes the same name `create` did.
+fn veth_name(prefix: char, pod_name: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    pod_name.hash(&mut hasher);
+    // Mask to 56 bits → 14 hex digits; prefix brings the total to 15.
+    format!("{prefix}{:014x}", hasher.finish() & 0x00ff_ffff_ffff_ffff)
 }
 
 #[cfg(test)]
@@ -373,8 +525,12 @@ mod tests {
     #[test]
     fn create_calls_runtime_in_order_and_captures_pause_pid() {
         let (mut sandbox, mut runtime) = make_sandbox("create");
-        sandbox.create(&mut runtime).expect("create should succeed");
+        sandbox
+            .create(&mut runtime, None)
+            .expect("create should succeed");
         assert_eq!(sandbox.pause_pid(), Some(4242));
+        // No IP passed → loopback-only path; pod_ip stays None.
+        assert_eq!(sandbox.pod_ip(), None);
         assert_eq!(
             runtime.calls,
             vec![
@@ -383,6 +539,17 @@ mod tests {
                 "pid(test-pod__pause)",
             ],
         );
+    }
+
+    #[test]
+    fn create_with_ip_records_pod_ip() {
+        let (mut sandbox, mut runtime) = make_sandbox("create-ip");
+        sandbox
+            .create(&mut runtime, Some("10.244.1.5".into()))
+            .expect("create should succeed");
+        // The IP bookkeeping is NOT cfg-gated, so it runs in tests even though
+        // the veth/bridge shell-outs are compiled out.
+        assert_eq!(sandbox.pod_ip(), Some("10.244.1.5"));
     }
 
     #[test]
@@ -399,7 +566,7 @@ mod tests {
     #[test]
     fn add_container_creates_and_starts_after_create() {
         let (mut sandbox, mut runtime) = make_sandbox("add-after-create");
-        sandbox.create(&mut runtime).unwrap();
+        sandbox.create(&mut runtime, None).unwrap();
         let pre = runtime.calls.len();
         sandbox
             .add_container(&mut runtime, &sample_app_container())
@@ -414,7 +581,7 @@ mod tests {
     #[test]
     fn remove_container_does_graceful_term_then_delete() {
         let (mut sandbox, mut runtime) = make_sandbox("remove-graceful");
-        sandbox.create(&mut runtime).unwrap();
+        sandbox.create(&mut runtime, None).unwrap();
         sandbox
             .add_container(&mut runtime, &sample_app_container())
             .unwrap();
@@ -437,7 +604,7 @@ mod tests {
     #[test]
     fn remove_container_tolerates_already_gone() {
         let (mut sandbox, mut runtime) = make_sandbox("remove-gone");
-        sandbox.create(&mut runtime).unwrap();
+        sandbox.create(&mut runtime, None).unwrap();
         sandbox
             .add_container(&mut runtime, &sample_app_container())
             .unwrap();
@@ -466,12 +633,16 @@ mod tests {
             vec!["web".into(), "log-tail".into()],
             pods_dir,
             rootfs,
+            Some("10.244.1.5".into()),
         );
 
         // pause_id is derived from pod_name; restart-recovery must reconstruct
         // the same id the original create() would have produced.
         assert_eq!(sandbox.pod_name(), "test-pod");
         assert_eq!(sandbox.pause_pid(), Some(9999));
+        // The recovered IP (read from the apiserver's persisted status) is
+        // carried through so the kubelet can re-reserve it in IPAM.
+        assert_eq!(sandbox.pod_ip(), Some("10.244.1.5"));
         assert_eq!(
             sandbox.app_container_names(),
             &["web".to_string(), "log-tail".to_string()],
@@ -484,7 +655,7 @@ mod tests {
     #[test]
     fn destroy_removes_app_containers_before_pause() {
         let (mut sandbox, mut runtime) = make_sandbox("destroy");
-        sandbox.create(&mut runtime).unwrap();
+        sandbox.create(&mut runtime, None).unwrap();
         sandbox
             .add_container(&mut runtime, &sample_app_container())
             .unwrap();
@@ -510,5 +681,26 @@ mod tests {
             web_delete_idx < pause_delete_idx,
             "app containers must be removed before pause (so they don't lose their netns mid-flight)",
         );
+    }
+
+    #[test]
+    fn veth_names_fit_ifnamsiz_and_are_deterministic() {
+        // Even an absurdly long pod name must yield a ≤15-byte interface name.
+        let long = "a-really-long-pod-name-that-exceeds-ifnamsiz-by-a-lot";
+        let host = host_veth_name(long);
+        let peer = peer_veth_name(long);
+        assert!(host.len() <= 15, "host veth {host:?} exceeds IFNAMSIZ");
+        assert!(peer.len() <= 15, "peer veth {peer:?} exceeds IFNAMSIZ");
+
+        // Host vs peer differ (distinct prefixes), so the pair can't clash.
+        assert_ne!(host, peer);
+        assert!(host.starts_with('v'));
+        assert!(peer.starts_with('p'));
+
+        // Deterministic: the SAME pod name always maps to the SAME name, so
+        // `destroy` (which recomputes it) targets the link `create` made.
+        assert_eq!(host, host_veth_name(long));
+        // Different pod names map to different host veths (no collision).
+        assert_ne!(host_veth_name("pod-a"), host_veth_name("pod-b"));
     }
 }

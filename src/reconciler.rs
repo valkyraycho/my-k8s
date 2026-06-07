@@ -226,6 +226,7 @@ impl<R: RuntimeClient> Reconciler<R> {
                         app_names,
                         self.pods_dir.clone(),
                         self.rootfs_base.clone(),
+                        pod.status.as_ref().and_then(|s| s.pod_ip.clone()),
                     );
                     self.store.insert(PodState {
                         pod: pod.clone(),
@@ -480,7 +481,10 @@ impl<R: RuntimeClient> Reconciler<R> {
             self.rootfs_base.clone(),
         );
         sandbox
-            .create(&mut self.runtime)
+            .create(
+                &mut self.runtime,
+                pod.status.as_ref().and_then(|s| s.pod_ip.clone()),
+            )
             .context("create sandbox")?;
 
         // Past this point, sandbox owns a live pause container. Any failure
