@@ -433,6 +433,12 @@ fn validate_pod(pod: &Pod) -> Result<(), ApiError> {
 
 // ---- Node handlers (mirror the Pod/ReplicaSet handlers, over node_store) ----
 
+// Cluster pod CIDR is 10.244.0.0/16, carved into per-node /24 slices: node
+// index n -> 10.244.n.0/24. The counter persists in sled (NODE_CIDR_COUNTER),
+// so slices are stable and never reused across apiserver restarts.
+const CLUSTER_POD_CIDR_PREFIX: &str = "10.244";
+const NODE_CIDR_COUNTER: &[u8] = b"node_cidr_counter";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeList {
@@ -492,9 +498,22 @@ pub async fn list_or_watch_nodes(
 
 pub async fn create_node(
     State(state): State<AppState>,
-    Json(node): Json<Node>,
+    Json(mut node): Json<Node>,
 ) -> Result<Response, ApiError> {
     validate_node(&node)?;
+    // Assign a /24 PodCIDR only if the node didn't bring its own AND isn't
+    // already registered. The get()-guard means a kubelet RESTART (which
+    // re-POSTs the same node) doesn't burn a fresh slice — `create` below will
+    // return AlreadyExists and the stored node keeps its original CIDR.
+    if node.spec.pod_cidr.is_none() && state.node_store.get(&node.metadata.name)?.is_none() {
+        let idx = state.node_store.next_index(NODE_CIDR_COUNTER)?;
+        if idx > 255 {
+            return Err(ApiError::Internal(format!(
+                "pod CIDR space exhausted (node index {idx} exceeds 255)"
+            )));
+        }
+        node.spec.pod_cidr = Some(format!("{CLUSTER_POD_CIDR_PREFIX}.{idx}.0/24"));
+    }
     let created = state.node_store.create(node)?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
@@ -1034,6 +1053,76 @@ mod tests {
         );
     }
 
+    /// Two distinct nodes registering (via the handler) get consecutive,
+    /// disjoint /24 slices — the IPAM coordination guarantee.
+    #[tokio::test]
+    async fn create_node_assigns_distinct_pod_cidrs() {
+        let (app, _, _, _) = setup_full();
+        let a = body_node(
+            app.clone()
+                .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let b = body_node(
+            app.oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-b")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(a.spec.pod_cidr.as_deref(), Some("10.244.0.0/24"));
+        assert_eq!(b.spec.pod_cidr.as_deref(), Some("10.244.1.0/24"));
+    }
+
+    /// A kubelet RESTART re-POSTs its node → 409 AlreadyExists, and crucially
+    /// does NOT consume a CIDR index (the next new node still gets .1, not .2).
+    #[tokio::test]
+    async fn create_node_reregistration_does_not_burn_a_cidr() {
+        let (app, _, _, _) = setup_full();
+        let a = body_node(
+            app.clone()
+                .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(a.spec.pod_cidr.as_deref(), Some("10.244.0.0/24"));
+
+        // Re-register node-a → rejected, no allocation.
+        let res = app
+            .clone()
+            .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // node-b proves the counter wasn't advanced by the failed re-register.
+        let b = body_node(
+            app.oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-b")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(b.spec.pod_cidr.as_deref(), Some("10.244.1.0/24"));
+    }
+
+    /// A node that brings its own pod_cidr keeps it — the apiserver only fills
+    /// the gap, it doesn't override an explicit assignment.
+    #[tokio::test]
+    async fn create_node_preserves_explicit_pod_cidr() {
+        let (app, _, _, _) = setup_full();
+        let mut node = make_node("node-x");
+        node.spec.pod_cidr = Some("10.244.7.0/24".into());
+        let created = body_node(
+            app.oneshot(json_req(Method::POST, "/api/v1/nodes", &node))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created.spec.pod_cidr.as_deref(), Some("10.244.7.0/24"));
+    }
+
     #[tokio::test]
     async fn node_create_rejects_empty_name() {
         let (app, _, _, _) = setup_full();
@@ -1224,7 +1313,10 @@ mod tests {
         // Catch-up: exactly one event, for "a".
         let ev = next_within(&mut stream, 100).await.expect("catch-up ev");
         assert_eq!(ev.object.metadata.name, "a");
-        assert!(next_within(&mut stream, 50).await.is_none(), "b must be filtered out");
+        assert!(
+            next_within(&mut stream, 50).await.is_none(),
+            "b must be filtered out"
+        );
 
         // Live: a new node-a pod is delivered; a node-b pod is not.
         let store_w = store.clone();
@@ -1234,6 +1326,9 @@ mod tests {
             store_w.create(make_pod_on("d", "node-a")).unwrap(); // delivered
         });
         let ev = next_within(&mut stream, 500).await.expect("live ev");
-        assert_eq!(ev.object.metadata.name, "d", "only the node-a live pod arrives");
+        assert_eq!(
+            ev.object.metadata.name, "d",
+            "only the node-a live pod arrives"
+        );
     }
 }

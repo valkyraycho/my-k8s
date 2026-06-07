@@ -84,6 +84,37 @@ impl<T: ResourceMeta> ResourceStore<T> {
         Ok(self.db.get(RV_COUNTER_KEY)?.map(decode_u64).unwrap_or(0))
     }
 
+    /// Atomically fetch-and-increment a named counter, returning the value
+    /// BEFORE the increment (first call yields 0). Separate from `rv_counter` —
+    /// used for one-off ID allocation like per-node PodCIDR indices. Persists in
+    /// sled, so an index is never reused across apiserver restarts.
+    pub fn next_index(&self, counter_key: &[u8]) -> Result<u64, StoreError> {
+        // `fetch_and_update(key, closure)`: sled reads the current bytes, runs
+        // `closure(old) -> new bytes`, and CAS-writes them — retrying the whole
+        // thing if another writer raced in. So the closure is the atomic unit.
+        // It returns the PREVIOUS value (`Option<IVec>`); `?` turns a sled I/O
+        // error into StoreError via the `#[from]` on StoreError::Sled.
+        let previous = self.db.fetch_and_update(counter_key, |old| {
+            // `old: Option<&[u8]>` — None on first use, else the raw stored bytes.
+            let current = old
+                // &[u8] -> [u8; 8] via TryInto (fails if len != 8); .ok() drops
+                // the error so `and_then` yields Option<[u8; 8]>.
+                .and_then(|b| b.try_into().ok())
+                // reinterpret the 8 bytes as a u64 (little-endian, matching how
+                // we write below and how `decode_u64` reads elsewhere).
+                .map(u64::from_le_bytes)
+                // missing/garbage key -> start the counter at 0.
+                .unwrap_or(0);
+            // New value to store: current+1 as 8 LE bytes. `saturating_add`
+            // can't wrap; `to_vec` because the closure must return owned bytes
+            // (Option<Vec<u8>>, which sled accepts as Into<IVec>).
+            Some(current.saturating_add(1).to_le_bytes().to_vec())
+        })?;
+        // `previous` is the bytes that were there before our increment; decode
+        // back to u64 (None on the very first call -> 0).
+        Ok(previous.map(decode_u64).unwrap_or(0))
+    }
+
     fn key(&self, name: &str) -> String {
         format!("{}{}", T::KIND_PREFIX, name)
     }
