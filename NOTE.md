@@ -15,6 +15,62 @@
 
 ---
 
+## Contents
+
+> Obsidian: click any entry to jump. (Links are `[[#heading]]` wikilinks — they resolve in Obsidian, not on GitHub.)
+
+- [[#Project at a glance]]
+- [[#Engineering principles, by example|⚙ Engineering principles index]]
+- [[#Phase 0 — Dev environment]]
+  - [[#OrbStack + Linux VM + VirtioFS]]
+  - [[#libcontainer smoke test]]
+  - [[#Devcontainer wrap]]
+- [[#Phase 1 — Mini-kubelet]]
+  - [[#1. CLI skeleton (`src/bin/kubelet.rs`)|1 · CLI skeleton]]
+  - [[#2. Pod schema (`src/pod.rs`)|2 · Pod schema]]
+  - [[#3. `RuntimeClient` trait — the mini-CRI (`src/runtime.rs`)|3 · RuntimeClient trait (mini-CRI)]]
+  - [[#4. Rootfs preparation (`scripts/prepare-rootfs.sh`)|4 · Rootfs preparation]]
+  - [[#5. Bundle construction (`src/runtime/bundle.rs`)|5 · Bundle construction]]
+  - [[#6. `YoukiRuntime` — libcontainer behind the trait (`src/runtime/youki.rs`)|6 · YoukiRuntime]]
+  - [[#7. Pod sandbox — the pause-container pattern (`src/runtime/sandbox.rs`)|7 · Pod sandbox (pause container)]]
+  - [[#8. In-memory pod store (`src/store.rs`)|8 · In-memory pod store]]
+  - [[#9. Manifest watcher (`src/watcher.rs`)|9 · Manifest watcher]]
+  - [[#10. Reconciler loop (`src/reconciler.rs`)|10 · Reconciler loop]]
+  - [[#11. Graceful shutdown (`src/bin/kubelet.rs`)|11 · Graceful shutdown]]
+  - [[#12. Mock-runtime integration test (`src/reconciler.rs` test module)|12 · Mock-runtime integration test]]
+  - [[#13. End-to-end demo|13 · End-to-end demo]]
+  - [[#14. Debug snapshot (`src/reconciler.rs` + `scripts/myctl.sh`)|14 · Debug snapshot]]
+  - [[#Phase 1 wrap — what this earned us|Phase 1 wrap]]
+- [[#Phase 2 — API server, watch streams, persistent store]]
+  - [[#1. Wire format — Pod gains status + apiserver metadata (`src/pod.rs`)|1 · Wire format (status + metadata)]]
+  - [[#2. PodStore — persistent storage + optimistic concurrency (`src/apiserver/storage.rs`)|2 · PodStore + optimistic concurrency]]
+  - [[#3. Watch streaming (`src/apiserver/watch.rs`)|3 · Watch streaming]]
+  - [[#4. HTTP surface — routes + handlers (`src/apiserver/{routes,handlers}.rs`)|4 · HTTP surface (routes + handlers)]]
+  - [[#5. apiserver binary (`src/bin/apiserver.rs`)|5 · apiserver binary]]
+  - [[#6. Client (`src/client.rs`)|6 · Client]]
+  - [[#7. Informer-style reconciler loop (`src/reconciler.rs`)|7 · Informer-style reconciler loop]]
+  - [[#8. Kubelet as a full client — reporting status back (`src/bin/kubelet.rs` + `src/reconciler.rs`)|8 · Kubelet status reporting]]
+  - [[#9. `mykubectl` — the command-line client (`src/bin/mykubectl.rs`)|9 · mykubectl CLI]]
+  - [[#10. End-to-end demo — the whole stack, live (verified 2026-06-01)|10 · End-to-end demo]]
+  - [[#Phase 2 wrap — what this earned us|Phase 2 wrap]]
+- [[#Phase 3 — Controllers: the ReplicaSet controller]]
+  - [[#1. Generalize the store to `ResourceStore<T>` + the ReplicaSet schema (`storage.rs`, `replicaset.rs`, `meta.rs`)|1 · Generic ResourceStore + RS schema]]
+  - [[#2. `ObjectMeta` gains labels + ownerReferences (`meta.rs`)|2 · ObjectMeta: labels + ownerReferences]]
+  - [[#3. The work queue (`controller/workqueue.rs`)|3 · The work queue]]
+  - [[#4. The reconcile function (`controller/replicaset.rs`)|4 · The reconcile function]]
+  - [[#5. The manager: composing the loops (`controller/manager.rs`)|5 · The manager]]
+  - [[#Phase 3 wrap — what this earned us|Phase 3 wrap]]
+- [[#Phase 4 — The scheduler & multi-node]]
+  - [[#1. `spec.nodeName` + the `Node` resource (`pod.rs`, `node.rs`)|1 · spec.nodeName + Node resource]]
+  - [[#2. `Node` in the apiserver (3rd store) + the binding subresource (`storage.rs`, `handlers.rs`, `routes.rs`)|2 · Node in apiserver + binding]]
+  - [[#3. Server-side `fieldSelector` — the centerpiece (`watch.rs`, `handlers.rs`)|3 · Server-side fieldSelector]]
+  - [[#4. The node-aware kubelet (`reconciler.rs`, `bin/kubelet.rs`)|4 · Node-aware kubelet]]
+  - [[#5. The scheduler — just another controller (`scheduler.rs`, `bin/scheduler.rs`)|5 · The scheduler]]
+  - [[#6. Multi-node demo (verified on the VM)|6 · Multi-node demo]]
+  - [[#Phase 4 wrap — what this earned us|Phase 4 wrap]]
+
+---
+
 ## Project at a glance
 
 `my-k8s` is a from-scratch mini-Kubernetes built in Rust as a multi-month learning project. The goal is **implementer's intuition, not production**: I want to be able to talk about K8s having actually built the parts. Not a fork of upstream k8s. Not a wrapper around `kube-rs`. Not feature-complete.
@@ -32,8 +88,8 @@
 | 1 | Single-node "mini-kubelet" — the **Pod sandbox** primitive | `mykubelet` watches a manifests dir, runs multi-container Pods ✅ |
 | 2 | API server v1 | kubelet talks to API server over HTTP; multiple kubelets possible ✅ |
 | 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it ✅ |
-| 4 | Scheduler | Pods distributed across 2+ kubelets ⬅ **next** |
-| 5 | Services & networking | `curl` a Service VIP, traffic load-balances |
+| 4 | Scheduler | Pods distributed across 2+ kubelets ✅ |
+| 5 | Services & networking | `curl` a Service VIP, traffic load-balances ⬅ **next** |
 | 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC |
 
 Phase 6 explicitly **dropped** "write your own runtime" — already done that in the prior Docker project. Replaced with distributed-systems content where the marginal learning is highest.
@@ -58,6 +114,10 @@ Phase 6 explicitly **dropped** "write your own runtime" — already done that in
 | **Decouple producers from consumers with a queue** | A dedup queue absorbs bursts, collapses duplicates, and separates *arrival rate* from *processing rate*. | controller work queue (P3) |
 | **Model identity & ownership explicitly** | Names get reused; use a stable id (uid) and explicit ownership links for lifecycle, cascade-delete, "is this mine?". | `uid` (P2 §1), `ownerReferences` (P3) |
 | **Refactor without churn via aliases** | Generalize the implementation, keep the old name as a type alias so call sites don't all change at once. | `PodMetadata = ObjectMeta`, `PodStore = ResourceStore<Pod>` (P3) |
+| **Separate decision from execution (policy as data)** | Split "what to do" (a decision, written as plain data) from "carry it out." The decider and the doer become independent, separately-testable, separately-scalable processes. | scheduler decides node → writes a *binding* → kubelet executes (P4) |
+| **Filter at the source (predicate pushdown)** | Push the filter to where the data lives instead of shipping everything and filtering at the consumer. Less data on the wire; each consumer subscribes to only its slice. | server-side `fieldSelector` on list/watch (P4) |
+| **Fail safe — default to the safe state** | When input is missing, stale, or unparseable, fall back to the choice that *can't* cause harm — not the permissive one. | stale/absent heartbeat ⇒ node NOT schedulable; bad selector ⇒ no filter (P4) |
+| **Liveness via freshness, not a trusted flag** | Don't believe a cached "I'm healthy" bit; require a recent heartbeat and treat staleness as down. A crashed reporter can't un-set its own flag. | scheduler checks `lastHeartbeatTime` age, ignores stale `ready` (P4) |
 
 ---
 
@@ -592,7 +652,7 @@ let tracker = restart_state.entry(id.clone()).or_insert_with(/* ... */); // upse
 
 **Gotcha — `expect()` on signal-handler registration is correct here.** If the OS won't let us install a SIGTERM handler, the process can't do its one job safely; panicking is the honest response. This is the rare case where `expect` beats graceful error handling — there's no meaningful recovery.
 
-## 12. Mock-runtime integration test (`src/reconciler.rs` `#[cfg(test)]`)
+## 12. Mock-runtime integration test (`src/reconciler.rs` test module)
 
 **The core trick — assert on a recorded call log.** `MockRuntime` implements `RuntimeClient` (§3) by doing nothing real — it just appends a string for each call to a `Vec<String>`. Tests then assert on that list. Because the reconciler only ever speaks the trait, swapping the real runtime for this recorder exercises *all* the orchestration logic with zero containers:
 ```
@@ -1254,8 +1314,189 @@ This is exactly how you'd kill a Pod and watch it come back: `delete_pod` → ap
 
 The **controller pattern**, the mechanism that makes Kubernetes *extensible*: an independent process that watches a desired-state resource and reconciles the world to match, built entirely as an ordinary apiserver client (no privileged access). Concretely: a generic `ResourceStore<T>` serving multiple kinds, label selectors + ownerReferences turning flat objects into an ownership graph, a deduplicating work queue, and a level-triggered reconcile that creates/deletes/adopts Pods and self-heals on deletion.
 
-But the durable takeaway is the **engineering judgment**, not the K8s trivia. This phase alone demonstrates: defer-generalization (rule of three), refactor-by-alias, couple-by-data, model-ownership-explicitly, decouple-via-queue, level-triggered reconciliation, idempotency-for-retry-safety, guard-others'-invariants, break-feedback-loops, deterministic-behavior, watch-for-latency/resync-for-safety, and design-for-disconnection. Every one of those (see the [Engineering principles index](#engineering-principles-by-example)) transfers to systems that have nothing to do with containers.
+But the durable takeaway is the **engineering judgment**, not the K8s trivia. This phase alone demonstrates: defer-generalization (rule of three), refactor-by-alias, couple-by-data, model-ownership-explicitly, decouple-via-queue, level-triggered reconciliation, idempotency-for-retry-safety, guard-others'-invariants, break-feedback-loops, deterministic-behavior, watch-for-latency/resync-for-safety, and design-for-disconnection. Every one of those (see the [[#Engineering principles, by example|Engineering principles index]]) transfers to systems that have nothing to do with containers.
 
 What we did NOT build: Deployments (rolling updates over ReplicaSets), multi-controller coordination, leader election (only one controller-manager may run safely today), and real readiness beyond the kubelet's phase report.
 
 **Phase 4 (next) is the scheduler.** Right now a Pod created by the RS controller has no node assignment — in a multi-node world, *something* must decide which kubelet runs it. The scheduler is yet another controller: watch for Pods with no node, score the candidates, write the binding. Same loop, new decision.
+
+---
+
+# Phase 4 — The scheduler & multi-node
+
+**The one new idea: placement is a decision, and a decision is just data.** Until now every Pod ran wherever the single kubelet was. With more than one node, *something* must decide *which* node runs each Pod. That something is the **scheduler** — and the beautiful part is how little it touches: it watches for Pods with no node assigned, picks one, and writes a single field (`spec.nodeName`) back through the apiserver. It never starts a container. The kubelet on the chosen node notices "this Pod is mine" and runs it. The scheduler *decides*; the kubelet *executes*; they never talk to each other.
+
+```
+   scheduler                 apiserver                 kubelet (node-a)
+   ─────────                 ─────────                 ────────────────
+   watch pods nodeName=∅ ───► (unscheduled pod)
+   pick node-a (filter+score)
+   POST .../binding {node-a}─► spec.nodeName = node-a
+                              └ watch pods nodeName=node-a ──► sees it → runs it
+```
+> **⚙ Principle — separate decision from execution; encode the decision as data.** The scheduler's entire output is one written field. Because the *decision* (where) is decoupled from the *execution* (how), they're independent processes — you can test the scheduler with no kubelet, swap the scheduling algorithm without touching the runtime, and run many kubelets that each only execute their own slice. Cue: *when a system both "chooses" and "does," split them — make the choice a piece of persisted data, and let the doer react to it. Decider and doer then evolve, fail, and scale independently.*
+
+New this phase: `spec.nodeName` (the binding target), a `Node` resource + heartbeat, the **binding subresource**, a server-side **`fieldSelector`** (the ambitious centerpiece), a node-aware kubelet, and a `scheduler` binary. Construction order below.
+
+## 1. `spec.nodeName` + the `Node` resource (`pod.rs`, `node.rs`)
+
+Two tiny additions carry the whole phase. First, the binding target on the Pod:
+```rust
+pub struct PodSpec {
+    pub containers: Vec<Container>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_name: Option<String>,   // None = unscheduled; Some = bound to that node
+}
+```
+`Option<String>` *is* the scheduled/unscheduled distinction — the scheduler watches for `None`, the kubelet filters for *its* `Some`. Then the `Node` itself — a machine that can run Pods, which self-registers and heartbeats:
+```rust
+pub struct NodeSpec { pub unschedulable: bool }          // cordon flag (default false)
+pub struct NodeStatus {
+    pub ready: bool,
+    pub last_heartbeat_time: Option<String>,             // RFC3339; freshness = liveness
+}
+impl ResourceMeta for Node { const KIND_PREFIX: &'static str = "nodes/"; /* meta()/status hooks */ }
+```
+> **⚙ Principle — model liveness as freshness, not a flag.** `NodeStatus` has a `ready` *bool*, but the truth lives in `last_heartbeat_time`. A node that crashes can't flip its own `ready` to false — but it *stops heartbeating*, and staleness is observable from outside. The flag is a hint; the timestamp is the fact. Cue: *to know if a remote component is alive, require it to keep proving so (a heartbeat) and treat silence as death — never trust a self-reported "I'm fine" bit that a dead process leaves frozen at true.* (Real K8s uses a richer `conditions` list; we kept a flat status because we only ever ask the one Ready+freshness question — see [[#Engineering principles, by example|defer-complexity]].)
+
+## 2. `Node` in the apiserver (3rd store) + the binding subresource (`storage.rs`, `handlers.rs`, `routes.rs`)
+
+Adding a third resource was almost free — the Phase 3 generic store just gets a third instantiation, all three sharing **one** sled DB (one global resourceVersion counter):
+```rust
+// AppState now carries three stores, one per kind, over the same Db:
+pub struct AppState {
+    pub store:      Arc<ResourceStore<Pod>>,        // = PodStore
+    pub rs_store:   Arc<ResourceStore<ReplicaSet>>,
+    pub node_store: Arc<ResourceStore<Node>>,       // NEW — zero new storage code
+}
+```
+> **⚙ Principle — a good abstraction makes the 3rd case free.** ReplicaSet (P3) was the case that *forced* the generic `ResourceStore<T>`; Node is the payoff — it reused every line. That's the signal a generalization was correct: the *next* user costs almost nothing. Cue: *judge an abstraction by the marginal cost of the case after the one that motivated it — near-zero means you cut the seam right; still-painful means you abstracted the wrong axis.*
+
+The **binding subresource** is how placement happens — a narrow, single-purpose endpoint:
+```rust
+// POST /api/v1/pods/{name}/binding   body: { "nodeName": "node-a" }
+pub async fn bind_pod(State(state), Path(name), Json(binding): Json<Binding>) -> Result<Response, ApiError> {
+    if binding.node_name.is_empty() { return Err(ApiError::BadRequest(...)); }
+    let mut pod = state.store.get(&name)?.ok_or(ApiError::NotFound(...))?;
+    pod.spec.node_name = Some(binding.node_name);     // stamp the one field
+    let updated = state.store.replace_spec(&name, pod)?;   // reuses rv-checked write (P2 §2)
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+```
+> **⚙ Principle — a subresource is interface segregation for a write.** Binding could have been "just PUT the whole Pod with nodeName set." A dedicated `/binding` endpoint that touches *only* placement means the scheduler needs no permission to edit anything else, the intent is explicit in the API, and the surface a future RBAC layer must guard is tiny. Cue: *when one actor should change only one aspect of an object, give it a narrow endpoint for exactly that, rather than handing it the whole object and trusting it to touch nothing else.*
+
+## 3. Server-side `fieldSelector` — the centerpiece (`watch.rs`, `handlers.rs`)
+
+The ambitious choice this phase: rather than ship every Pod to every kubelet and filter client-side, the apiserver filters **server-side, per subscriber**. A kubelet asks for `?fieldSelector=spec.nodeName=node-a` and its watch only ever sees *its* Pods. This threads a predicate all the way into the generic watch stream:
+```rust
+pub fn stream_events<T, F>(store: Arc<ResourceStore<T>>, from_rv: u64, filter: F)
+    -> impl Stream<Item = Result<WatchEvent<T>, WatchError>>
+where T: ResourceMeta, F: Fn(&T) -> bool + Send + 'static {   // ① the bound that matters
+    try_stream! {
+        /* catch-up */ for obj in snapshot { if rv(&obj) > from_rv && filter(&obj) { yield added(obj) } }
+        /* live      */ loop { match rx.recv().await { Ok(ev) => if rv > snap && filter(&ev.object) { yield ev }, ... } }
+    }
+}
+```
+And the Pod handler builds the predicate as a single owned closure:
+```rust
+let node_filter = parse_node_name_selector(params.field_selector.as_deref()); // Option<String>
+let filter = move |p: &Pod| match &node_filter {          // ② ONE closure, branch on captured data
+    Some(node) => p.spec.node_name.as_deref() == Some(node.as_str()),
+    None => true,                                          // no selector ⇒ match all
+};
+stream_events(state.store.clone(), from_rv, filter)
+```
+> **⚙ Principle — filter at the source (predicate pushdown).** The same instinct as a SQL `WHERE` running in the database, not in your app: move the predicate to where the data already is, so you transmit only what's wanted. Here it also means each kubelet's watch is isolated to its own node's Pods — less wire traffic, and a natural security/blast-radius boundary. Cue: *when a consumer wants a subset, push the filter toward the producer; shipping everything "and filtering later" wastes bandwidth and leaks data the consumer shouldn't see.*
+>
+> **⚙ Principle (Rust) — capture owned data in a `'static` closure, branch inside.** `F: Fn(&T) -> bool + Send + 'static` is the crux: the closure outlives the request (it lives inside the `try_stream!` generator, on its own task), so it can't borrow — it must `move` and own its captures (the `Option<String>`). And note the design choice: rather than *return one of two different closure types* (which would need `Box<dyn Fn>`), we make **one** closure that captures the `Option` and branches on it — a single concrete type, no allocation, no dynamic dispatch. Cue: *a closure that escapes to another task must own everything it touches (`move` + `'static`); to keep "filter or don't" as one type, capture the choice as data and branch inside, instead of picking between closures.*
+>
+> **⚙ Principle — be lenient at the boundary, safe by default.** `parse_node_name_selector` understands exactly one selector (`spec.nodeName=`); anything else returns `None` → no filtering. An unrecognized selector degrades to "show everything," never to an error or an empty result. Cue: *a parser at a system boundary should fall back to a safe, obvious default on input it doesn't understand, rather than failing hard — but make sure the default is the safe one (here, "no filter" can't hide a Pod from a kubelet that needs it).*
+
+## 4. The node-aware kubelet (`reconciler.rs`, `bin/kubelet.rs`)
+
+The kubelet gains a `--node-name` (clap `env = "NODE_NAME"`, default `node-0`) and three new behaviors. First it **registers itself** — idempotently:
+```rust
+match self.client.create_node(&node).await {
+    Ok(_) => info!("registered node"),
+    Err(ClientError::AlreadyExists) => info!("node already registered"), // ← restart/race = success
+    Err(e) => return Err(...),
+}
+```
+> **⚙ Principle — make registration idempotent.** A kubelet restarts, or two start at once — "already exists" is not an error, it's the steady state. Treating `AlreadyExists` as success means registration is safe to run every boot with no "have I registered?" bookkeeping. Cue: *operations that establish state ("ensure X exists") should succeed whether or not X was already there — idempotency turns "did I already do this?" from a question you must answer into one you never ask.*
+
+Then a **heartbeat loop** on its own task, refreshing `lastHeartbeatTime` every 10s:
+```rust
+let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);   // first tick fires IMMEDIATELY
+loop {
+    tokio::select! { _ = cancel.cancelled() => return, _ = interval.tick() => {} }
+    // get node → take its rv → PUT fresh status (ready:true, lastHeartbeatTime: now)
+}
+```
+> **⚙ Gotcha turned principle — know your timer's first-tick semantics.** `tokio::time::interval`'s **first `.tick()` returns immediately**, so the node is marked Ready the instant the kubelet starts — no 10s window where a freshly-booted node looks dead. (Elsewhere — the reconciler's resync — we *await-and-discard* the first tick on purpose, to avoid acting before startup finishes.) Same API, opposite need. Cue: *before using any periodic timer, check whether tick #1 fires now or after one period — it's a perennial off-by-one-interval bug (Go's `time.Ticker` does NOT fire immediately; tokio's `interval` does).* (This bug prompted a Rust-vault note on tick scheduling.)
+
+Finally, the kubelet switches its Pod watch to `watch_pods_on_node(&node_name)` / `list_pods_on_node` — so it only ever sees Pods bound to it. Because the server already filtered (§3), `apply_watch_event` needs **no** node guard: every Pod that arrives is, by construction, this node's to run.
+
+## 5. The scheduler — just another controller (`scheduler.rs`, `bin/scheduler.rs`)
+
+Structurally identical to the controller-manager (P3 §5): informer + resync + worker over one queue. Only the *unit of work* differs — it's `schedule(pod_name)` instead of `reconcile(rs_name)`, and the informer enqueues Pods with **no** `nodeName`:
+```rust
+pub async fn schedule(pod_name: &str, client: &Client) -> Result<()> {
+    let pod = client.get_pod(pod_name).await?;            // re-read FRESH (level-triggered)
+    if pod.spec.node_name.is_some() { return Ok(()); }    // someone already placed it → done
+
+    let now = Utc::now();
+    let nodes = client.list_nodes().await?;
+    let candidates: Vec<&Node> = nodes.iter().filter(|n| is_schedulable(n, now)).collect(); // FILTER
+    if candidates.is_empty() { bail!("no Ready node available for pod {pod_name}"); }
+
+    // SCORE: least-loaded. Count each candidate's current pods, pick the min.
+    let all_pods = client.list_pods().await?;
+    let mut load: HashMap<&str, usize> = candidates.iter().map(|n| (n.name(), 0)).collect();
+    for p in &all_pods { if let Some(n) = &p.spec.node_name { load.entry(n).and_modify(|v| *v += 1); } }
+    let chosen = candidates.iter().min_by_key(|n| load[n.name()]).unwrap();
+
+    client.bind_pod(pod_name, chosen.name()).await        // WRITE the decision
+}
+```
+The filter is the liveness gate:
+```rust
+fn is_schedulable(node: &Node, now: DateTime<Utc>) -> bool {
+    if node.spec.unschedulable { return false; }                 // cordoned
+    let Some(status) = &node.status else { return false; };       // never heartbeated
+    if !status.ready { return false; }
+    match &status.last_heartbeat_time {
+        Some(ts) => parse(ts).map_or(false, |hb| (now - hb).num_seconds() < STALENESS_WINDOW_SECS),
+        None => false,                                            // ← every unknown ⇒ NOT schedulable
+    }
+}
+```
+> **⚙ Principle — filter → score → act, and make the filter fail-safe.** Scheduling is two phases: *filter* to feasible candidates (hard constraints — Ready, fresh, not cordoned), then *score* the survivors (soft preference — least-loaded) and pick the best. Crucially, every uncertain case in `is_schedulable` returns **false**: no status, no heartbeat, unparseable timestamp, stale → all "not a candidate." Cue: *for a placement/selection decision, separate must-haves (filter) from nice-to-haves (score); and when a candidate's fitness is unknown, exclude it — binding a Pod to a maybe-dead node is worse than waiting for a definitely-live one.*
+>
+> **⚙ Principle — reuse the loop, change the verb.** The scheduler is not a new kind of program — it's the controller skeleton (P3) with `schedule` swapped in for `reconcile`. Once you have "watch → enqueue key → worker reconciles," every new control plane component is *that shape with a different decision function*. Cue: *recognize when a "new" requirement is an instance of a pattern you already have; the scheduler, the RS controller, and the kubelet are one loop wearing three hats.*
+
+## 6. Multi-node demo (verified on the VM)
+
+Two kubelets on the one VM host, made logically distinct by `--node-name` + separate `--state-dir` (same Linux kernel runs all the containers; the *node* identity is what differs):
+```
+   apiserver + controller-manager + scheduler, then:
+   kubelet --node-name node-a --state-dir /var/lib/my-k8s/state-a
+   kubelet --node-name node-b --state-dir /var/lib/my-k8s/state-b
+   mykubectl apply -f rs.yml   (replicas: 4)
+   → RS controller creates 4 Pods (nodeName=∅)
+   → scheduler spreads them least-loaded → 2 on node-a, 2 on node-b → all Running
+   → mykubectl get nodes   shows node-a, node-b Ready
+```
+**The liveness test:** `kill` node-b's kubelet → its heartbeat goes stale (>30s) → scale the RS to 6 → the scheduler places **both** new Pods on node-a only (node-b excluded as stale), while node-b's *existing* Pods are left untouched (the scheduler only places the unscheduled; it doesn't evict). That's the heartbeat-freshness liveness gate (§1, §5) working end-to-end.
+
+> **⚙ Gotcha — `mykubectl get nodes` READY is a display wart.** The READY column just echoes `status.ready`, which a dead node leaves frozen at `true` (nothing flips it). The *scheduler* ignores that bool and checks heartbeat freshness, so placement is correct — but the table lies until you'd compute READY from heartbeat age too. Worth knowing: the authoritative liveness signal is `lastHeartbeatTime`, not `ready`.
+
+## Phase 4 wrap — what this earned us
+
+A real **scheduler** and a **multi-node** cluster: Pods get placed onto live nodes by an independent component whose entire job is to write one field, kubelets self-register and prove liveness by heartbeat, and the apiserver serves each kubelet a server-filtered slice of Pods via `fieldSelector`. The control plane is now four cooperating loops — apiserver (state), controller-manager (replicas), scheduler (placement), kubelet (execution) — none aware of the others, all coordinating through watched, versioned state.
+
+The transferable engineering haul (all in the [[#Engineering principles, by example|index]]): separate-decision-from-execution (policy as data), filter-at-the-source (predicate pushdown), fail-safe defaults, liveness-via-freshness, idempotent registration, a-good-abstraction-makes-the-3rd-case-free, subresource-as-interface-segregation, and the recurring reuse-the-loop-change-the-verb. Plus a sharp Rust lesson: escaping closures must own their captures (`move + Send + 'static`), and "filter or not" stays one type by capturing the choice as data.
+
+What we did NOT build: scheduling beyond least-loaded (no resource requests/limits, affinity, taints/tolerations), Pod eviction/rescheduling off a dead node (we only place the unscheduled), and leader election (one scheduler instance only).
+
+**Phase 5 (next) is Services & networking.** Pods now spread across nodes — but they have per-Pod IPs that come and go. A Service gives a stable virtual IP that load-balances across a changing set of Pods, which means programming the dataplane (iptables/netfilter, the kube-proxy model). The control-loop muscle carries over; the new frontier is the Linux network stack.

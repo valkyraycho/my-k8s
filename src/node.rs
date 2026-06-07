@@ -23,6 +23,13 @@ pub struct NodeSpec {
     /// If true, the scheduler skips this node (cordoned). Defaults false.
     #[serde(default)]
     pub unschedulable: bool,
+    // The /24 slice of the cluster pod CIDR this node owns (e.g.
+    // "10.244.1.0/24"), assigned by the apiserver on registration. The kubelet
+    // allocates pod IPs from it. Lives in SPEC: it's an assigned intent the
+    // kubelet must obey, not something it observes. `rename = "podCIDR"` keeps
+    // the K8s wire key (camelCase would give `podCidr`).
+    #[serde(rename = "podCIDR", skip_serializing_if = "Option::is_none")]
+    pub pod_cidr: Option<String>,
 }
 
 /// Flat status — just enough for "is this node Ready and heartbeating recently?"
@@ -175,5 +182,28 @@ mod tests {
         // unschedulable defaults false and round-trips.
         let parsed: Node = serde_json::from_str(&json).unwrap();
         assert!(!parsed.spec.unschedulable);
+    }
+
+    /// `pod_cidr` uses the real K8s wire key `podCIDR` (NOT camelCase
+    /// `podCidr`), is omitted when None, and round-trips when present.
+    #[test]
+    fn node_spec_pod_cidr_uses_podcidr_wire_key_and_skips_none() {
+        // Absent → key omitted (not `null`), parses back to None.
+        let json = serde_json::to_string(&node("node-a")).unwrap();
+        assert!(!json.contains("podCIDR"), "None should omit the key: {json}");
+
+        let with_cidr = Node {
+            spec: NodeSpec {
+                unschedulable: false,
+                pod_cidr: Some("10.244.1.0/24".into()),
+            },
+            ..node("node-a")
+        };
+        let json = serde_json::to_string(&with_cidr).unwrap();
+        assert!(json.contains(r#""podCIDR":"10.244.1.0/24""#), "got: {json}");
+        assert!(!json.contains("podCidr"), "must not camelCase: {json}");
+
+        let parsed: Node = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.spec.pod_cidr.as_deref(), Some("10.244.1.0/24"));
     }
 }

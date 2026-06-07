@@ -428,6 +428,9 @@ impl<R: RuntimeClient> Reconciler<R> {
             phase,
             container_statuses,
             observed_generation: pod.metadata.generation,
+            // Placeholder until Step 5 wires IPAM: the sandbox doesn't carry an
+            // IP yet. Reported as absent (omitted on the wire) for now.
+            pod_ip: None,
         }
     }
 

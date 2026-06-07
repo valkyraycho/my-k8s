@@ -181,7 +181,10 @@ mod tests {
                 name: "n".into(),
                 ..Default::default()
             },
-            spec: NodeSpec { unschedulable },
+            spec: NodeSpec {
+                unschedulable,
+                pod_cidr: None,
+            },
             status: Some(NodeStatus {
                 ready,
                 last_heartbeat_time: hb.map(String::from),

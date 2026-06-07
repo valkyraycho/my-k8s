@@ -83,6 +83,13 @@ pub struct PodStatus {
     pub container_statuses: Vec<ContainerStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+    // The pod's IPv4 address, assigned by the kubelet's IPAM when the sandbox
+    // network comes up; `None` until then. Lives in STATUS (observed), not spec:
+    // the kubelet discovers it, the apiserver just stores what it reports.
+    // `rename = "podIP"`: camelCase would emit `podIp`, but real K8s keeps the
+    // initialism fully capitalized.
+    #[serde(rename = "podIP", skip_serializing_if = "Option::is_none")]
+    pub pod_ip: Option<String>,
 }
 
 /// NOTE: deliberately NO `#[serde(rename_all)]`. K8s phases are PascalCase on
@@ -292,6 +299,7 @@ spec:
                     },
                 }],
                 observed_generation: Some(1),
+                pod_ip: Some("10.244.1.5".into()),
             }),
         };
 
@@ -303,5 +311,30 @@ spec:
         assert!(json.contains(r#""status""#));
         assert!(json.contains(r#""phase":"Running""#));
         assert!(json.contains(r#""containerStatuses""#));
+    }
+
+    /// `pod_ip` uses the real K8s wire key `podIP` (NOT camelCase `podIp`), and
+    /// is omitted entirely when None rather than serialized as `null`.
+    #[test]
+    fn pod_status_pod_ip_uses_podip_wire_key_and_skips_none() {
+        let with_ip = PodStatus {
+            phase: PodPhase::Running,
+            container_statuses: vec![],
+            observed_generation: None,
+            pod_ip: Some("10.244.2.7".into()),
+        };
+        let json = serde_json::to_string(&with_ip).unwrap();
+        assert!(json.contains(r#""podIP":"10.244.2.7""#), "got: {json}");
+        assert!(!json.contains("podIp"), "must not camelCase to podIp: {json}");
+
+        let parsed: PodStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, with_ip);
+
+        // None → key omitted, not `null`.
+        let no_ip = PodStatus::default();
+        let json = serde_json::to_string(&no_ip).unwrap();
+        assert!(!json.contains("podIP"), "None should omit the key: {json}");
+        let parsed: PodStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pod_ip, None);
     }
 }

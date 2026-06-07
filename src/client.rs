@@ -459,6 +459,7 @@ mod tests {
             phase: PodPhase::Running,
             container_statuses: vec![],
             observed_generation: Some(1),
+            pod_ip: None,
         };
         let updated = client
             .replace_pod_status("web", &status, &rv)

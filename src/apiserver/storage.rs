@@ -360,6 +360,7 @@ mod tests {
                 },
             }],
             observed_generation: Some(1),
+            pod_ip: None,
         }
     }
 
