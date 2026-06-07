@@ -21,6 +21,7 @@
 
 - [[#Project at a glance]]
 - [[#Engineering principles, by example|⚙ Engineering principles index]]
+- [[#How validation works in this project|✅ Validation & testing (all phases)]]
 - [[#Phase 0 — Dev environment]]
   - [[#OrbStack + Linux VM + VirtioFS]]
   - [[#libcontainer smoke test]]
@@ -68,6 +69,15 @@
   - [[#5. The scheduler — just another controller (`scheduler.rs`, `bin/scheduler.rs`)|5 · The scheduler]]
   - [[#6. Multi-node demo (verified on the VM)|6 · Multi-node demo]]
   - [[#Phase 4 wrap — what this earned us|Phase 4 wrap]]
+- [[#Phase 5a — Real pod networking]]
+  - [[#1. Schema: `PodStatus.pod_ip` + `NodeSpec.pod_cidr` (`pod.rs`, `node.rs`)|1 · Schema: podIP + podCIDR]]
+  - [[#2. Pure IPAM allocator (`src/ipam.rs`)|2 · Pure IPAM allocator]]
+  - [[#3. apiserver assigns each Node a /24 (`handlers.rs`/`storage.rs`)|3 · apiserver assigns /24]]
+  - [[#4. Sandbox: veth + bridge wiring (`runtime/sandbox.rs`)|4 · Sandbox: veth + bridge]]
+  - [[#5. Reconciler: IPAM lifecycle + recovery (`reconciler.rs`)|5 · Reconciler: IPAM + recovery]]
+  - [[#6. mykubectl IP column|6 · mykubectl IP column]]
+  - [[#7. e2e validation (on the VM)|7 · e2e validation]]
+  - [[#Phase 5a wrap — what this earned us|Phase 5a wrap]]
 
 ---
 
@@ -89,7 +99,8 @@
 | 2 | API server v1 | kubelet talks to API server over HTTP; multiple kubelets possible ✅ |
 | 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it ✅ |
 | 4 | Scheduler | Pods distributed across 2+ kubelets ✅ |
-| 5 | Services & networking | `curl` a Service VIP, traffic load-balances ⬅ **next** |
+| 5a | Real pod networking | cross-node `wget <pod-ip>:8080` works; IPs survive restart ✅ |
+| 5b | Services & networking | `curl` a Service VIP, traffic load-balances ⬅ **next** |
 | 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC |
 
 Phase 6 explicitly **dropped** "write your own runtime" — already done that in the prior Docker project. Replaced with distributed-systems content where the marginal learning is highest.
@@ -118,6 +129,77 @@ Phase 6 explicitly **dropped** "write your own runtime" — already done that in
 | **Filter at the source (predicate pushdown)** | Push the filter to where the data lives instead of shipping everything and filtering at the consumer. Less data on the wire; each consumer subscribes to only its slice. | server-side `fieldSelector` on list/watch (P4) |
 | **Fail safe — default to the safe state** | When input is missing, stale, or unparseable, fall back to the choice that *can't* cause harm — not the permissive one. | stale/absent heartbeat ⇒ node NOT schedulable; bad selector ⇒ no filter (P4) |
 | **Liveness via freshness, not a trusted flag** | Don't believe a cached "I'm healthy" bit; require a recent heartbeat and treat staleness as down. A crashed reporter can't un-set its own flag. | scheduler checks `lastHeartbeatTime` age, ignores stale `ready` (P4) |
+
+---
+
+# How validation works in this project
+
+> **Why this section exists.** "How do I know it's correct?" is as much an engineering skill as writing the code. This project proves correctness in **four layers**, cheapest/fastest first, each catching what the layer below can't. Knowing which layer to reach for — and that the slow on-VM e2e is the *last* resort, not the first — is the point. The per-phase e2e catalog at the end is the recall list: what each phase's end-to-end run actually demonstrated.
+
+## The four layers
+
+```
+   layer                 runs where     speed     catches
+   ─────                 ──────────     ─────     ───────
+   1 pure unit tests     anywhere       µs–ms     logic/algebra (no I/O, no root)
+   2 in-process integ.   anywhere       ms        component wiring over real HTTP (no containers)
+   3 mock-runtime tests  anywhere       ms        orchestration logic w/o libcontainer/root
+   4 on-VM e2e (manual)  mykube-dev VM  seconds   the real Linux kernel: ns, veth, cgroups, signals
+```
+
+**Layer 1 — pure unit tests.** Functions with no I/O are tested directly. The design *enables* this: pure functions are carved out precisely so they're testable without a world. Examples: `IpAllocator` (allocate/reserve/release/exhaustion, P5a), `matches_selector` + `is_schedulable` (table-driven predicates, P3/P4), `compute_backoff`, bundle namespace wiring (P1 §5), all the serde round-trips (wire-format fields, externally-tagged enums). *Cue: if it's pure, it has no excuse not to be unit-tested.*
+
+**Layer 2 — in-process integration tests.** Spin up the **real apiserver router** on an OS-assigned port (`TcpListener::bind("127.0.0.1:0")` + `axum::serve` on a background task), point a real `Client` at it, and drive actual HTTP. This proves serialization, routing, status-envelope mapping, optimistic-concurrency conflicts, and **watch streams** end-to-end — *without a single container*. The RS controller and scheduler tests go further: they spawn the apiserver **and** the full `manager::run()` / scheduler `run()`, then poll until the cluster converges (e.g. `wait_for_pod_count`). This is why `manager::run()` lives in the **lib, not the bin** — so the whole control loop is integration-testable in-process. Examples: `create_then_list_roundtrip`, `watch_stream_receives_added_event`, `controller_recreates_a_deleted_pod`, `run_schedules_unscheduled_pods_end_to_end`.
+
+**Layer 3 — mock-runtime tests.** The kubelet's reconciler is generic over `RuntimeClient`; tests substitute a `MockRuntime` that records calls and serves canned states. This exercises sandbox-lifecycle ordering, CrashLoopBackOff, partial-create rollback, status dedup, and restart recovery — all the orchestration logic — **with no libcontainer, no root, no Linux**. This is the entire payoff of the trait seam (P1 §3): the hard-to-run dependency is mocked, the logic is tested everywhere.
+
+**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **155 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
+
+## Running the automated layers (1–3)
+
+All `cargo` runs happen **inside the VM** (`libcontainer` + its `procfs` dep are Linux-only and won't build on macOS), via SSH against the VirtioFS-mounted source:
+```bash
+ssh mykube-dev@orb 'source $HOME/.cargo/env && \
+  cargo nextest run --manifest-path=/Users/raycho/solo-leveling/rust/my-k8s/Cargo.toml'
+```
+> **⚙ Principle — make the slow/privileged dependency the thinnest possible layer, then mock or isolate it.** Root + Linux + real containers are the expensive part of testing an orchestrator, so the design pushes *all* of that behind one trait (`RuntimeClient`) and one set of shell-outs (`#[cfg(not(test))]` in `sandbox.rs`). Everything above can then be tested fast and anywhere; only the irreducible kernel-truth checks need the VM. Cue: *identify the dependency that makes tests slow/privileged/flaky, quarantine it behind a seam, and you convert most of your test suite from "needs the world" to "runs anywhere."*
+>
+> **⚙ Principle — scale time down in tests with `#[cfg(test)]` constants.** Production intervals (10s heartbeat, 30s staleness, 5min backoff cap) would make tests sleep for minutes. Each is a `#[cfg(test)]` constant set to milliseconds, so the *same code path* runs but the suite stays in the ms range. Cue: *when behavior depends on real durations, make the durations constants you can shrink under test — don't `sleep` real seconds in a unit test, and don't fake the clock if a smaller constant will do.*
+
+## Per-phase e2e catalog (what each on-VM run proved)
+
+Each entry: the scenario, the key command(s), and the **property** it demonstrated that the automated layers couldn't.
+
+**Phase 0 — runtime works at all.** `sudo target/debug/scratch` → a busybox container runs end-to-end via libcontainer, cgroup v2 auto-detected, clean exit. *Proved: the runtime layer functions in our VM before any orchestration exists (the tracer bullet).*
+
+**Phase 1 — the Pod sandbox & self-healing.** Against a manifests dir watched by the kubelet:
+- `cp web.yml manifests/active/` → sandbox + httpd come up; `curl <pod-ip>:8080` serves. *Proved: pause-container sandbox + a container actually run and serve.*
+- `cp sidecar.yml …` → `readlink /proc/<httpd-pid>/ns/net == /proc/<sidecar-pid>/ns/net`. *Proved: shared-netns is real at the kernel level (setns works).*
+- `kill -9 <httpd-pid>` → within ~2s the reconciler restarts it; sandbox + sidecar untouched, **pod IP unchanged**. *Proved: liveness reconciliation + the pause holds the namespace across a container restart.*
+- `rm web.yml` → full teardown; `kill -TERM <kubelet>` → graceful shutdown, no orphans (`pgrep -f /var/lib/my-k8s` empty). *Proved: deletion propagation + graceful SIGTERM teardown.*
+
+**Phase 2 — the two-tier control plane.** apiserver (non-root) + kubelet (root) + mykubectl:
+- `mykubectl apply -f web.yml` → watch fires ADDED → kubelet runs it → `mykubectl get pods` shows `Running 1/1` → `curl` serves. *Proved: the full desired→watch→run→status→observe loop over HTTP.*
+- `kill -9` the kubelet, restart → `recover_all` count=2 → `from_recovered` reattaches → **httpd PID unchanged, no dup containers**. *Proved: kubelet restart recovery doesn't disturb running pods.*
+- `kill -9` the apiserver, restart → a previously-applied pod is still there. *Proved: sled persistence survives an apiserver crash.*
+- Operational gotchas learned here: `with_graceful_shutdown` hangs while a watch is open (needs `kill -9`); sled is single-writer (2nd apiserver fails to open — fail-safe); apiserver DB dir must be pre-created + `chown`ed to the non-root run user; `pkill -f kubelet` over SSH self-matches your shell → use a bracket pattern `[k]ubelet`.
+
+**Phase 3 — the ReplicaSet controller.** apiserver + controller-manager + kubelet:
+- `mykubectl apply -f rs.yml` (replicas: 3) → 3 pods created and Running. *Proved: controller create-to-match.*
+- delete one pod → controller recreates it (the canonical "kill a pod, it comes back"). *Proved: Pod DELETED event → ownerRef → enqueue RS → reconcile → recreate, the self-heal loop end-to-end.*
+- scale 3→1 → surplus (oldest-first) deleted; delete the RS → cascade teardown to 0 containers, `state/pods` empty. *Proved: scale-down + cascade-delete via ownerReferences.*
+
+**Phase 4 — scheduler & multi-node.** Two kubelets (`--node-name node-a`/`node-b`, separate `--state-dir`) + scheduler:
+- RS replicas=4 → scheduler spreads least-loaded → 2 on node-a, 2 on node-b, all Running; `mykubectl get nodes` shows both Ready. *Proved: binding-subresource placement + least-loaded spread + per-node fieldSelector watch each kubelet only runs its own pods.*
+- `kill` node-b's kubelet → its heartbeat goes stale (>30s) → scale RS to 6 → **both** new pods land on node-a only; node-b's existing pods left alone. *Proved: heartbeat-freshness liveness gate excludes the dead node; the scheduler places only the unscheduled (no eviction).*
+
+**Phase 5a — real pod networking.** Two kubelets, each assigned a distinct /24 by the apiserver:
+- RS replicas=3 spread across both nodes → each pod gets an IP from **its node's** /24 (`mykubectl get pods` IP column). *Proved: apiserver per-node PodCIDR assignment + per-node IPAM hand out non-overlapping addresses.*
+- **cross-node** `wget <pod-ip>:8080` from a pod on node-a to a pod on node-b → succeeds. *Proved: veth+bridge puts every pod on one flat L2 segment (`mykube0`), so cross-(logical-)node traffic works with no routing/overlay.*
+- `kill` a kubelet, restart → its pods' **IPs survive** (recovered from apiserver `status.podIP`, re-`reserve()`d into the rebuilt allocator before any fresh allocate). *Proved: IP persistence across kubelet restart — and WHY pod IP lives in `status` (it's the recovery source of truth).*
+- Two bugs this e2e caught (both invisible to layers 1–3): the `ensure_bridge` idempotency race (losing kubelet's `ip addr add` says "already assigned", not "File exists" → crash on startup), and `resync()` using cluster-wide `list_pods()` instead of `list_pods_on_node` (surviving node tried to adopt a dead node's pods). *Lesson: a scoping filter must be threaded through **every** read path — watch, startup, AND resync — not just the obvious ones.*
+
+> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 155 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
 
 ---
 
@@ -1500,3 +1582,115 @@ The transferable engineering haul (all in the [[#Engineering principles, by exam
 What we did NOT build: scheduling beyond least-loaded (no resource requests/limits, affinity, taints/tolerations), Pod eviction/rescheduling off a dead node (we only place the unscheduled), and leader election (one scheduler instance only).
 
 **Phase 5 (next) is Services & networking.** Pods now spread across nodes — but they have per-Pod IPs that come and go. A Service gives a stable virtual IP that load-balances across a changing set of Pods, which means programming the dataplane (iptables/netfilter, the kube-proxy model). The control-loop muscle carries over; the new frontier is the Linux network stack.
+
+> **Phase 5 was split** into **5a (real pod networking)** — build the IPs first, ship independently — and **5b (Services)** — re-plan once pods are actually reachable. Driver: before 5a, pods had only loopback; there were no pod IPs for a Service VIP to target. This section is 5a.
+
+---
+
+# Phase 5a — Real pod networking
+
+**The shift: the new frontier is the Linux network stack, not another control loop.** Every phase so far added a control-plane loop; 5a is different — the orchestration is familiar, but pods finally get **routable IPs** and can talk to each other across (logical) nodes. Before this, a pod had only `lo`. After it, each pod has an `eth0` on a shared bridge with a cluster-unique address, and `wget <pod-ip>:8080` works from any pod to any other.
+
+The three locked design decisions that make this simple:
+1. **One flat host bridge** `mykube0` (cluster CIDR `10.244.0.0/16`, gateway `.0.1`). All kubelets share ONE Linux host, so a single bridge puts every pod on one L2 segment — cross-(logical-)node reachability for free, no overlay, no routing.
+2. **Per-node /24 PodCIDR.** The apiserver hands each Node a disjoint `10.244.{n}.0/24` on registration. Disjoint slices mean two kubelets never hand out the same IP **without any coordination** — the partition *is* the coordination.
+3. **No new crates** — shell out to `ip`/`nsenter` (the same tools a real CNI plugin drives).
+
+```
+                         host: mykube0 bridge  10.244.0.1/16  (one L2 segment)
+        ┌───────────── veth ─────────────┐         ┌───────────── veth ─────────────┐
+   node-a kubelet (/24 = 10.244.1.0/24)            node-b kubelet (/24 = 10.244.2.0/24)
+   pod p1  eth0 10.244.1.2/16 ───┐                 pod p3  eth0 10.244.2.2/16 ───┐
+   pod p2  eth0 10.244.1.3/16 ───┴── all on mykube0 ── p1 can wget p3 directly ──┘
+```
+
+## 1. Schema: `PodStatus.pod_ip` + `NodeSpec.pod_cidr` (`pod.rs`, `node.rs`)
+
+Two `Option<String>` fields carry the whole feature. The placement of `pod_ip` is the deepest decision:
+```rust
+pub struct PodStatus { /* phase, container_statuses, ... */
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_ip: Option<String>,        // serde: "podIP" — OBSERVED, so it lives in status
+}
+pub struct NodeSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pod_cidr: Option<String>,      // serde: "podCIDR" — the node's assigned /24
+}
+```
+> **⚙ Principle — put a fact where its writer and its recovery path live.** `pod_ip` goes in **status**, not spec, because the *kubelet* assigns it (it's observed reality, not desired intent) — and crucially, it becomes the **recovery source of truth**: a restarted kubelet reads each pod's `status.podIP` back from the apiserver and re-reserves it, so IPs survive restarts. Spec is "what I want"; status is "what is" — an assigned IP is emphatically the latter. Cue: *decide who owns a field by asking "who writes it, and who needs to read it back after a crash?" — that usually tells you spec vs status (desired vs observed).*
+
+## 2. Pure IPAM allocator (`src/ipam.rs`)
+
+A self-contained allocator over one /24 — the CNI `host-local` plugin in miniature. Pure (no I/O), so it's exhaustively unit-tested (Layer 1):
+```rust
+pub struct IpAllocator {
+    prefix: [u8; 3],          // e.g. [10,244,1] for 10.244.1.0/24
+    next: u16,                // cursor: next 4th-octet to try
+    released: BTreeSet<u8>,   // freed addrs, REUSED before advancing (compact pool, smallest-first)
+    allocated: BTreeSet<u8>,  // in-use; lets reserve() claim out of order, allocate() skip it
+}
+// allocate(): reuse a released addr first, else advance the cursor skipping `allocated`. .2..=.254 → 253 usable.
+// reserve(ip): mark in-use out-of-band — the recovery path, idempotent, runs BEFORE any fresh allocate.
+// release(ip): return to pool; no-op if not ours (best-effort teardown).
+```
+> **⚙ Principle — separate the *policy* (which IP) from the *mechanism* (wiring it up).** `IpAllocator` decides addresses with zero knowledge of veth, bridges, or netns — it's just integer-set bookkeeping. The sandbox (§4) does the kernel wiring with zero knowledge of allocation strategy. That seam is why the allocation logic is 100% unit-testable without root, and why you could swap the strategy (random, ranges) without touching networking. Cue: *a "decide" step and a "do" step almost always want to be different functions/modules — the decider stays pure and testable, the doer stays thin.*
+>
+> **⚙ Principle — partition to avoid coordination.** Two kubelets allocate IPs concurrently with **no locks, no consensus, no chatter** — because each owns a disjoint /24. The hard distributed problem (don't double-assign) is dissolved by carving the space so overlaps are structurally impossible. Cue: *before reaching for a lock or a consensus protocol to coordinate writers, ask whether you can partition the resource so they never contend in the first place — disjoint ownership is the cheapest concurrency control there is.*
+
+## 3. apiserver assigns each Node a /24 (`handlers.rs`/`storage.rs`)
+
+On `create_node`, the apiserver stamps the next slice via a persistent sled counter (`node_cidr_counter`): node *n* → `10.244.{n}.0/24`. The assignment is guarded by a get()-check so a **re-registering** kubelet doesn't burn a fresh slice each restart.
+> **⚙ Principle — make resource assignment idempotent across retries.** Registration is create-or-already-exists (P4); the CIDR assignment rides the *create* path and is skipped when the Node already exists — so a kubelet can restart-and-re-register all day and keep its same /24. Cue: *any "assign a scarce resource on first contact" step must detect "already assigned" and return the existing value, or restarts silently leak the resource (here: exhaust the /16 one reboot at a time).*
+
+## 4. Sandbox: veth + bridge wiring (`runtime/sandbox.rs`)
+
+The kernel mechanism. `create(runtime, pod_ip: Option<String>)` now branches: an IP → full networking; `None` → loopback-only fallback (the Phase-1 behavior). `ensure_bridge()` (idempotent, run once at kubelet startup) makes the shared `mykube0`; `setup_pod_network` wires each pod:
+```rust
+// create the veth "cable", host end onto the bridge:
+run(&["ip","link","add", &host_veth, "type","veth","peer","name", &peer])?;
+run(&["ip","link","set", &host_veth, "master", BRIDGE_NAME])?;   // mykube0
+run(&["ip","link","set", &host_veth, "up"])?;
+run(&["ip","link","set", &peer, "netns", &pause_pid])?;          // peer INTO the pod netns
+// inside the netns (via nsenter -t <pause_pid> -n): become eth0, address /16, default route:
+nsenter(&pid, &["ip","link","set", &peer, "name","eth0"])?;
+nsenter(&pid, &["ip","addr","add", &format!("{pod_ip}/16"), "dev","eth0"])?;
+nsenter(&pid, &["ip","link","set","eth0","up"])?;
+nsenter(&pid, &["ip","route","add","default","via", BRIDGE_GATEWAY])?;
+```
+> **⚙ Concept — a veth pair is a virtual patch cable.** One end stays in the host and plugs into the bridge; the other end is *moved* into the pod's network namespace (targeted by the pause PID) and renamed `eth0`. The `/16` address (not `/24`!) is deliberate: it tells the pod "the whole cluster is on my local segment," so cross-node pods are reachable directly over the bridge with just a default route — no inter-node routing needed. This is exactly what a CNI plugin does; we're hand-rolling the `bridge` + `host-local` plugins.
+>
+> **⚙ Principle — idempotent setup must tolerate the *exact* failure wording, and races have more than one loser-shape.** `ensure_bridge` runs in every kubelet; the second one to start must treat "already there" as success. The bug caught in e2e: `ip link add` says `"File exists"` but `ip addr add` says `"Address already assigned"` — so tolerating only the first phrasing crashed the losing kubelet on the *address* step. Fix: `run_tolerate` takes a **slice** of acceptable substrings. Cue: *when making an operation idempotent by swallowing "already exists" errors, enumerate every distinct way the underlying tool can phrase it — one tolerated string is rarely enough.*
+>
+> **⚙ Decision — a stable, length-bounded veth name from the pod name.** `veth_name` = `'v'`/`'p'` + 14 hex of `DefaultHasher(pod_name)` — deterministic (so restart finds the same interface) and ≤15 chars (the kernel `IFNAMSIZ` limit). Cue: *when an external system caps an identifier's length, hash a stable input down to fit rather than truncating (which collides) or counting (which isn't restart-stable).*
+
+## 5. Reconciler: IPAM lifecycle + recovery (`reconciler.rs`)
+
+The kubelet gains `ipam: Option<IpAllocator>`, built in `startup()` from its own Node's `podCIDR` (learned from the apiserver — the source of truth for CIDR). The recovery ordering is the subtle, important part:
+```rust
+// startup(): for every pod already on this node (from the apiserver),
+//   RESERVE its status.podIP into the allocator BEFORE any fresh create_pod() can allocate:
+if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref())
+    && let (Some(ipam), Ok(addr)) = (self.ipam.as_mut(), ip.parse()) {
+    let _ = ipam.reserve(addr);   // survivor's IP claimed first → no fresh pod can collide
+}
+// ensure_pod_ip(): reuse the pod's existing status.podIP if set, else allocate() a new one.
+// release_ip(): on pod removal, return the IP to the pool.
+// compute_pod_status(): report pod_ip up so it persists + drives the next recovery.
+```
+> **⚙ Principle — on recovery, claim known state before minting new state.** The reservation pass runs *before* any fresh allocation, so a restarted kubelet can never hand a live survivor's IP to a new pod. Order matters: reserve-then-allocate is safe; allocate-then-reserve would let a new pod grab `.2` before the survivor's `.2` is reclaimed. Cue: *crash recovery should first re-establish what's already true (reserve existing assignments) and only then make new decisions — rebuild the world before you add to it.* This is the same shape as the kubelet reattaching sandboxes (P2 §7); IP recovery is that pattern applied to addresses.
+
+## 6. mykubectl IP column
+
+`mykubectl get pods` gained an `IP` column reading `status.podIP` — the observable proof, from a pure apiserver client, that the kubelet assigned and reported each address.
+
+## 7. e2e validation (on the VM)
+
+See the [[#How validation works in this project|Validation catalog]] → "Phase 5a" for the full run. In short, two kubelets with distinct /24s; an RS of 3 spread across both; each pod got an IP from its node's slice; **cross-node `wget <pod-ip>:8080` succeeded** (flat bridge = one L2 segment); and pod IPs **survived a kubelet kill+restart** (recovered from `status.podIP` and re-reserved). Two latent bugs surfaced only here — the `ensure_bridge` wording race and `resync()` using cluster-wide `list_pods()` instead of `list_pods_on_node` — both documented in the catalog.
+
+## Phase 5a wrap — what this earned us
+
+Real pod networking: every pod gets a routable, cluster-unique IPv4 via veth+bridge, reported up to the apiserver and surviving kubelet restarts. The control plane is unchanged in shape; what's new is that the *data plane* exists — pods can finally reach each other. The transferable haul ([[#Engineering principles, by example|index]]): policy-vs-mechanism (allocator vs wiring), partition-to-avoid-coordination (disjoint /24s = lock-free IPAM), idempotent-resource-assignment, claim-known-state-before-minting-new (recovery ordering), and the hard-won idempotency lesson that you must tolerate every wording of "already exists."
+
+What we did NOT build (deferred to 5b): Services (a stable virtual IP), an endpoints controller (tracking which pod IPs back a Service), and the iptables/netfilter DNAT dataplane (the kube-proxy analog). 5a gave Services something real to point at.
+
+**Phase 5b (next) is Services.** Pod IPs are real now but ephemeral — they change as pods come and go. A Service is a stable ClusterIP that load-balances across the current backing pods, which means an endpoints controller (a familiar reconcile loop) feeding iptables DNAT rules (the unfamiliar netfilter part).
