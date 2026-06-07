@@ -292,13 +292,16 @@ const BRIDGE_CIDR: &str = "10.244.0.1/16";
 /// present — `ip`'s "File exists" is success, not failure (`run_tolerate`).
 #[cfg(not(test))]
 pub fn ensure_bridge() -> anyhow::Result<()> {
+    // Two kubelets race here; the loser must treat "already there" as success.
+    // `ip` words it differently per object (link-add vs addr-add), so tolerate
+    // both phrasings.
     run_tolerate(
         &["ip", "link", "add", BRIDGE_NAME, "type", "bridge"],
-        "File exists",
+        &["File exists", "already exists"],
     )?;
     run_tolerate(
         &["ip", "addr", "add", BRIDGE_CIDR, "dev", BRIDGE_NAME],
-        "File exists",
+        &["File exists", "already assigned"],
     )?;
     run(&["ip", "link", "set", BRIDGE_NAME, "up"])?;
     // Pods route out via the bridge gateway; forwarding must be enabled.
@@ -376,7 +379,7 @@ fn run(args: &[&str]) -> anyhow::Result<()> {
 /// the bridge is already there). String-matching is fragile in general, but
 /// `ip`'s wording is stable; it's the CLI equivalent of ignoring an EEXIST.
 #[cfg(not(test))]
-fn run_tolerate(args: &[&str], tolerate: &str) -> anyhow::Result<()> {
+fn run_tolerate(args: &[&str], tolerate: &[&str]) -> anyhow::Result<()> {
     let output = std::process::Command::new(args[0])
         .args(&args[1..])
         .output()
@@ -386,7 +389,8 @@ fn run_tolerate(args: &[&str], tolerate: &str) -> anyhow::Result<()> {
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains(tolerate) {
+    // Success if stderr matches ANY tolerated phrase (idempotent setup).
+    if tolerate.iter().any(|t| stderr.contains(t)) {
         return Ok(());
     }
 

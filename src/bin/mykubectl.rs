@@ -212,8 +212,8 @@ async fn delete(client: &Client, resource: &str, name: &str) -> Result<()> {
 /// `{:<20}` is left-align-in-20-cols formatting for the columns.
 fn print_pod_table(pods: &[Pod]) {
     println!(
-        "{:<20} {:<10} {:<8} {:<10} AGE",
-        "NAME", "PHASE", "READY", "RESTARTS",
+        "{:<20} {:<10} {:<8} {:<10} {:<16} AGE",
+        "NAME", "PHASE", "READY", "RESTARTS", "IP",
     );
 
     for pod in pods {
@@ -231,6 +231,12 @@ fn print_pod_table(pods: &[Pod]) {
             ),
             None => (0, pod.spec.containers.len(), 0),
         };
+        // Pod IP from status, or "<none>" until the kubelet assigns + reports one.
+        let ip = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.pod_ip.as_deref())
+            .unwrap_or("<none>");
         let age = pod
             .metadata
             .creation_timestamp
@@ -239,11 +245,12 @@ fn print_pod_table(pods: &[Pod]) {
             .unwrap_or_else(|| "<unknown>".into());
 
         println!(
-            "{:<20} {:<10} {:<8} {:<10} {}",
+            "{:<20} {:<10} {:<8} {:<10} {:<16} {}",
             pod.metadata.name,
             phase_str(pod),
             format!("{ready}/{total}"),
             restarts,
+            ip,
             age,
         );
     }

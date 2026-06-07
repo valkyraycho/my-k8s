@@ -14,10 +14,14 @@ use tracing::{error, info, info_span, warn};
 use crate::{
     apiserver::watch::{WatchEvent, WatchEventType},
     client::{Client, ClientError},
+    ipam::IpAllocator,
     meta::ObjectMeta,
     node::{Node, NodeSpec, NodeStatus},
     pod::{ContainerStatus, ContainerStatusState, Pod, PodName, PodPhase, PodStatus},
-    runtime::{ContainerState, RecoveredContainer, RuntimeClient, sandbox::PodSandbox},
+    runtime::{
+        ContainerState, RecoveredContainer, RuntimeClient,
+        sandbox::{PodSandbox, ensure_bridge},
+    },
     store::{PodState, Store},
 };
 
@@ -76,6 +80,7 @@ pub struct Reconciler<R: RuntimeClient> {
     debug_dump_path: Option<PathBuf>,
     cache: HashMap<PodName, Pod>,
     last_pushed_status: HashMap<PodName, PodStatus>,
+    ipam: Option<IpAllocator>,
 }
 
 impl<R: RuntimeClient> Reconciler<R> {
@@ -98,6 +103,7 @@ impl<R: RuntimeClient> Reconciler<R> {
             debug_dump_path,
             cache: HashMap::new(),
             last_pushed_status: HashMap::new(),
+            ipam: None,
         }
     }
 
@@ -179,6 +185,21 @@ impl<R: RuntimeClient> Reconciler<R> {
 
     async fn startup(&mut self) -> Result<()> {
         self.register_node().await?;
+        block_in_place(ensure_bridge).context("ensure host bridge")?;
+
+        // Learn our /24 from the apiserver (the source of truth for CIDR), then
+        // build the allocator from it.
+        let node = self
+            .client
+            .get_node(&self.node_name)
+            .await?
+            .context("node not found after registration")?;
+        let cidr = node
+            .spec
+            .pod_cidr
+            .context("node has no podCIDR assigned by apiserver")?;
+        self.ipam = Some(IpAllocator::from_cidr(&cidr).context("build IP allocator")?);
+        info!(node = %self.node_name, %cidr, "IPAM ready");
         let recovered = block_in_place(|| self.runtime.recover_all())
             .context("recover containers from runtime state dir")?;
         info!(
@@ -202,6 +223,15 @@ impl<R: RuntimeClient> Reconciler<R> {
         }
 
         for pod in initial_pods {
+            // Reserve every already-assigned IP BEFORE any fresh allocate (in
+            // create_pod) can run — else a new pod could collide with a survivor.
+            if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref())
+                && let (Some(ipam), Ok(addr)) = (self.ipam.as_mut(), ip.parse())
+                && let Err(e) = ipam.reserve(addr)
+            {
+                warn!(error = ?e, pod = %pod.metadata.name, ip, "failed to reserve recovered pod IP");
+            }
+
             let name = pod.metadata.name.clone();
             let pause_id = format!("{name}__pause");
 
@@ -306,7 +336,13 @@ impl<R: RuntimeClient> Reconciler<R> {
     }
 
     async fn resync(&mut self) -> Result<()> {
-        let pods = self.client.list_pods().await.context("resync list")?;
+        // Node-scoped, like watch + startup: a kubelet reconciles only ITS pods.
+        // Cluster-wide list_pods() would make every node try to adopt every pod.
+        let pods = self
+            .client
+            .list_pods_on_node(&self.node_name)
+            .await
+            .context("resync list")?;
         let desired: HashMap<PodName, Pod> = pods
             .into_iter()
             .map(|p| (p.metadata.name.clone(), p))
@@ -361,6 +397,13 @@ impl<R: RuntimeClient> Reconciler<R> {
     /// precedence (below) mirrors real K8s: "not fully up" dominates "up".
     fn compute_pod_status(&mut self, pod: &Pod) -> PodStatus {
         let name = &pod.metadata.name;
+        // Read the IP (owned) before the &mut self.runtime loop below, so the
+        // immutable store borrow ends first.
+        let pod_ip = self
+            .store
+            .get(name)
+            .and_then(|s| s.sandbox.pod_ip())
+            .map(String::from);
         // `with_capacity`: we know exactly how many we'll push — one alloc, no
         // re-growth. A small but idiomatic perf habit when the size is known.
         let mut container_statuses = Vec::with_capacity(pod.spec.containers.len());
@@ -429,9 +472,7 @@ impl<R: RuntimeClient> Reconciler<R> {
             phase,
             container_statuses,
             observed_generation: pod.metadata.generation,
-            // Placeholder until Step 5 wires IPAM: the sandbox doesn't carry an
-            // IP yet. Reported as absent (omitted on the wire) for now.
-            pod_ip: None,
+            pod_ip,
         }
     }
 
@@ -475,16 +516,14 @@ impl<R: RuntimeClient> Reconciler<R> {
 
     fn create_pod(&mut self, pod: &Pod) -> Result<()> {
         info!("creating pod {}", pod.metadata.name);
+        let pod_ip = self.ensure_pod_ip(pod)?;
         let mut sandbox = PodSandbox::new(
             pod.metadata.name.clone(),
             self.pods_dir.clone(),
             self.rootfs_base.clone(),
         );
         sandbox
-            .create(
-                &mut self.runtime,
-                pod.status.as_ref().and_then(|s| s.pod_ip.clone()),
-            )
+            .create(&mut self.runtime, Some(pod_ip.clone()))
             .context("create sandbox")?;
 
         // Past this point, sandbox owns a live pause container. Any failure
@@ -498,6 +537,7 @@ impl<R: RuntimeClient> Reconciler<R> {
                     "add_container failed; rolling back partial sandbox",
                 );
                 let _ = sandbox.destroy(&mut self.runtime);
+                self.release_ip(&pod_ip);
                 return Err(e).with_context(|| format!("add container {}", container.name));
             }
         }
@@ -507,6 +547,29 @@ impl<R: RuntimeClient> Reconciler<R> {
             sandbox,
         });
         Ok(())
+    }
+
+    /// Reuse an existing pod IP (recovered / re-applied) or allocate a fresh one.
+    fn ensure_pod_ip(&mut self, pod: &Pod) -> Result<String> {
+        if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.clone())
+            && let (Some(ipam), Ok(addr)) = (self.ipam.as_mut(), ip.parse())
+        {
+            let _ = ipam.reserve(addr);
+            return Ok(ip);
+        }
+
+        let ipam = self
+            .ipam
+            .as_mut()
+            .context("IPAM not initialized (startup did not run?)")?;
+        Ok(ipam.allocate().context("allocate pod IP")?.to_string())
+    }
+
+    /// Return an IP to the pool. Best-effort: cleanup must never fail on this.
+    fn release_ip(&mut self, ip: &str) {
+        if let (Some(ipam), Ok(addr)) = (self.ipam.as_mut(), ip.parse()) {
+            ipam.release(addr);
+        }
     }
 
     fn remove_pod(&mut self, name: &str) -> Result<()> {
@@ -519,7 +582,13 @@ impl<R: RuntimeClient> Reconciler<R> {
                 self.restart_state.remove(&container_id);
             }
             self.last_pushed_status.remove(name);
+            // Copy the IP out (owned) before destroy, so we can release it after
+            // without holding a borrow of `state` across the &mut self call.
+            let ip = state.sandbox.pod_ip().map(String::from);
             state.sandbox.destroy(&mut self.runtime)?;
+            if let Some(ip) = ip {
+                self.release_ip(&ip);
+            }
         }
         Ok(())
     }
@@ -893,14 +962,18 @@ mod tests {
         // Pointing at a closed port catches any accidental call with a fast
         // ConnectionRefused instead of hanging.
         let client = Arc::new(Client::new("http://127.0.0.1:1"));
-        Reconciler::new(
+        let mut r = Reconciler::new(
             client,
             "node-test".into(),
             pods_dir,
             rootfs,
             MockRuntime::default(),
             None,
-        )
+        );
+        // Tests bypass startup() (which normally builds IPAM from the apiserver),
+        // so seed an allocator directly over a test /24.
+        r.ipam = Some(crate::ipam::IpAllocator::from_cidr("10.244.5.0/24").unwrap());
+        r
     }
 
     fn desired_map(pods: Vec<Pod>) -> HashMap<PodName, Pod> {
@@ -951,6 +1024,72 @@ mod tests {
         assert!(start_pause < pid_pause);
         assert!(pid_pause < create_app);
         assert!(create_app < start_app);
+    }
+
+    #[test]
+    fn new_pod_gets_ip_from_node_cidr_and_reports_it() {
+        let mut r = make_reconciler("ip-assign");
+        r.runtime.pids.insert("web__pause".into(), 4242);
+        let pod = make_pod("web", vec![("server", vec!["httpd"])]);
+
+        r.apply_diff(&desired_map(vec![pod.clone()]));
+
+        // First allocation from 10.244.5.0/24 → .2 (skips .0/.1).
+        let sandbox_ip = r.store.get("web").unwrap().sandbox.pod_ip();
+        assert_eq!(sandbox_ip, Some("10.244.5.2"));
+
+        // And it surfaces in the computed status (what gets PUT to the apiserver).
+        let status = r.compute_pod_status(&pod);
+        assert_eq!(status.pod_ip.as_deref(), Some("10.244.5.2"));
+    }
+
+    #[test]
+    fn removed_pod_releases_ip_for_reuse() {
+        let mut r = make_reconciler("ip-reuse");
+        r.runtime.pids.insert("web__pause".into(), 1);
+        r.runtime.pids.insert("api__pause".into(), 2);
+
+        // web takes .2, then is removed (releasing .2).
+        r.apply_diff(&desired_map(vec![make_pod("web", vec![("c", vec!["x"])])]));
+        assert_eq!(
+            r.store.get("web").unwrap().sandbox.pod_ip(),
+            Some("10.244.5.2")
+        );
+        r.apply_diff(&desired_map(vec![]));
+
+        // Next new pod reuses the freed .2 rather than advancing to .3.
+        r.apply_diff(&desired_map(vec![make_pod("api", vec![("c", vec!["x"])])]));
+        assert_eq!(
+            r.store.get("api").unwrap().sandbox.pod_ip(),
+            Some("10.244.5.2")
+        );
+    }
+
+    #[test]
+    fn pod_with_existing_status_ip_reuses_it() {
+        let mut r = make_reconciler("ip-existing");
+        r.runtime.pids.insert("web__pause".into(), 1);
+        r.runtime.pids.insert("api__pause".into(), 2);
+
+        // A pod that already carries an IP in status (recovered / re-applied)
+        // keeps it; the allocator must then NOT hand that IP to another pod.
+        let mut web = make_pod("web", vec![("c", vec!["x"])]);
+        web.status = Some(PodStatus {
+            pod_ip: Some("10.244.5.50".into()),
+            ..Default::default()
+        });
+        r.apply_diff(&desired_map(vec![web]));
+        assert_eq!(
+            r.store.get("web").unwrap().sandbox.pod_ip(),
+            Some("10.244.5.50")
+        );
+
+        // A fresh pod allocates around the reserved .50 (gets .2, the first free).
+        r.apply_diff(&desired_map(vec![make_pod("api", vec![("c", vec!["x"])])]));
+        assert_eq!(
+            r.store.get("api").unwrap().sandbox.pod_ip(),
+            Some("10.244.5.2")
+        );
     }
 
     #[test]
