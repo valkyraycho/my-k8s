@@ -4,6 +4,7 @@ use my_k8s::{
     client::Client,
     pod::{Pod, PodPhase},
     replicaset::ReplicaSet,
+    service::Service,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -99,7 +100,28 @@ async fn apply(client: &Client, file: &Path) -> Result<()> {
                 }
             }
         }
-        other => bail!("unsupported kind {other:?}; only Pod and ReplicaSet are supported"),
+        "Service" => {
+            let mut svc: Service =
+                serde_yaml_ng::from_str(&yaml).context("parsing Service YAML")?;
+            match client.get_service(&svc.metadata.name).await? {
+                Some(existing) => {
+                    // Preserve the assigned ClusterIP + rv across a re-apply.
+                    svc.metadata.resource_version = existing.metadata.resource_version;
+                    if svc.spec.cluster_ip.is_none() {
+                        svc.spec.cluster_ip = existing.spec.cluster_ip;
+                    }
+                    let updated = client.replace_service_spec(&svc).await?;
+                    println!("service/{} replaced", updated.metadata.name);
+                }
+                None => {
+                    let created = client.create_service(&svc).await?;
+                    println!("service/{} created", created.metadata.name);
+                }
+            }
+        }
+        other => {
+            bail!("unsupported kind {other:?}; only Pod, ReplicaSet and Service are supported")
+        }
     }
     Ok(())
 }
@@ -109,7 +131,11 @@ async fn get(client: &Client, resource: &str, name: Option<String>, watch: bool)
         "pod" | "pods" => get_pods(client, name, watch).await,
         "rs" | "replicaset" | "replicasets" => get_replicasets(client, name).await,
         "node" | "nodes" => get_nodes(client, name).await,
-        other => bail!("unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs"),
+        "svc" | "service" | "services" => get_services(client, name).await,
+        "ep" | "endpoints" => get_endpoints(client, name).await,
+        other => bail!(
+            "unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs, node(s), svc, endpoints"
+        ),
     }
 }
 
@@ -158,6 +184,50 @@ async fn get_nodes(client: &Client, name: Option<String>) -> Result<()> {
     Ok(())
 }
 
+async fn get_services(client: &Client, name: Option<String>) -> Result<()> {
+    match name {
+        Some(name) => match client.get_service(&name).await? {
+            Some(svc) => print!(
+                "{}",
+                serde_yaml_ng::to_string(&svc).context("serializing service")?
+            ),
+            None => bail!("service/{name:?} not found"),
+        },
+        None => print_svc_table(&client.list_services().await?),
+    }
+    Ok(())
+}
+
+async fn get_endpoints(client: &Client, name: Option<String>) -> Result<()> {
+    match name {
+        Some(name) => match client.get_endpoints(&name).await? {
+            Some(ep) => print!(
+                "{}",
+                serde_yaml_ng::to_string(&ep).context("serializing endpoints")?
+            ),
+            None => bail!("endpoints/{name:?} not found"),
+        },
+        None => {
+            // Table: NAME + the comma-joined backend ip:port list.
+            let items = client.list_endpoints().await?;
+            println!("{:<20} ENDPOINTS", "NAME");
+            for ep in &items {
+                let backends = if ep.addresses.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    ep.addresses
+                        .iter()
+                        .map(|a| format!("{}:{}", a.ip, a.port))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                println!("{:<20} {}", ep.metadata.name, backends);
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn watch_pods(client: &Client, name: Option<String>) -> Result<()> {
     let mut stream = client.watch_pods(None).await?;
     println!("{:<10} {:<10} NAME", "EVENT", "PHASE");
@@ -201,7 +271,20 @@ async fn delete(client: &Client, resource: &str, name: &str) -> Result<()> {
             }
             None => bail!("replicaset/{name:?} not found"),
         },
-        other => bail!("unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs"),
+        "svc" | "service" | "services" => match client.get_service(name).await? {
+            Some(svc) => {
+                let rv = svc
+                    .metadata
+                    .resource_version
+                    .ok_or_else(|| anyhow::anyhow!("service/{name:?} has no resource version"))?;
+                client.delete_service(name, &rv).await?;
+                println!("service/{name} deleted");
+            }
+            None => bail!("service/{name:?} not found"),
+        },
+        other => bail!(
+            "unsupported resource {other:?}; supported: pod(s), replicaset(s)/rs, svc"
+        ),
     }
     Ok(())
 }
@@ -325,5 +408,24 @@ fn print_node_table(items: &[my_k8s::node::Node]) {
             .map(age_str)
             .unwrap_or_else(|| "<unknown>".into());
         println!("{:<16} {:<8} {}", n.metadata.name, ready, age);
+    }
+}
+
+/// The `kubectl get svc` table: the stable VIP and its port mapping.
+fn print_svc_table(items: &[Service]) {
+    println!(
+        "{:<16} {:<14} {:<10} AGE",
+        "NAME", "CLUSTER-IP", "PORT",
+    );
+    for svc in items {
+        let cluster_ip = svc.spec.cluster_ip.as_deref().unwrap_or("<none>");
+        let port = format!("{}/TCP", svc.spec.port);
+        let age = svc
+            .metadata
+            .creation_timestamp
+            .as_deref()
+            .map(age_str)
+            .unwrap_or_else(|| "<unknown>".into());
+        println!("{:<16} {:<14} {:<10} {}", svc.metadata.name, cluster_ip, port, age);
     }
 }

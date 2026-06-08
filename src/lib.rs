@@ -17,6 +17,7 @@ pub mod client;
 pub mod controller;
 pub mod endpoints;
 pub mod ipam;
+pub mod kube_proxy;
 pub mod meta;
 pub mod node;
 pub mod pod;
