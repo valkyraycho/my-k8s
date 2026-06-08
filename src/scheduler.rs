@@ -223,7 +223,13 @@ mod tests {
         let app = router(AppState {
             store: Arc::new(PodStore::from_db(db.clone()).unwrap()),
             rs_store: Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).unwrap()),
-            node_store: Arc::new(ResourceStore::<Node>::from_db(db).unwrap()),
+            node_store: Arc::new(ResourceStore::<Node>::from_db(db.clone()).unwrap()),
+            svc_store: Arc::new(
+                ResourceStore::<crate::service::Service>::from_db(db.clone()).unwrap(),
+            ),
+            ep_store: Arc::new(
+                ResourceStore::<crate::endpoints::Endpoints>::from_db(db).unwrap(),
+            ),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

@@ -15,6 +15,7 @@
 pub mod apiserver;
 pub mod client;
 pub mod controller;
+pub mod endpoints;
 pub mod ipam;
 pub mod meta;
 pub mod node;

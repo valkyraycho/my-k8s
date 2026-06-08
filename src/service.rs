@@ -41,3 +41,58 @@ impl ResourceMeta for Service {
         &mut self.metadata
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn service(name: &str) -> Service {
+        let mut selector = BTreeMap::new();
+        selector.insert("app".into(), "web".into());
+        Service {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            metadata: ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: ServiceSpec {
+                selector,
+                port: 80,
+                target_port: 8080,
+                cluster_ip: Some("10.96.0.5".into()),
+            },
+        }
+    }
+
+    /// Round-trips through JSON with the K8s wire keys: `clusterIP` (NOT
+    /// camelCase `clusterIp`) and `targetPort`. Selector survives intact.
+    #[test]
+    fn service_roundtrips_with_clusterip_wire_key() {
+        let svc = service("web");
+        let json = serde_json::to_string(&svc).unwrap();
+        assert!(json.contains(r#""clusterIP":"10.96.0.5""#), "got: {json}");
+        assert!(!json.contains("clusterIp"), "must not camelCase: {json}");
+        assert!(json.contains(r#""targetPort":8080"#), "got: {json}");
+        assert!(json.contains(r#""selector":{"app":"web"}"#), "got: {json}");
+
+        let parsed: Service = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, svc);
+    }
+
+    /// An unassigned ClusterIP omits the key entirely (not `null`); a missing
+    /// selector defaults to empty.
+    #[test]
+    fn service_omits_none_clusterip_and_defaults_selector() {
+        let mut svc = service("web");
+        svc.spec.cluster_ip = None;
+        let json = serde_json::to_string(&svc).unwrap();
+        assert!(!json.contains("clusterIP"), "None should omit key: {json}");
+
+        // A minimal Service with no selector still parses (selector defaults).
+        let minimal = r#"{"apiVersion":"v1","kind":"Service","metadata":{"name":"x"},"spec":{"port":80,"targetPort":8080}}"#;
+        let parsed: Service = serde_json::from_str(minimal).unwrap();
+        assert!(parsed.spec.selector.is_empty());
+        assert_eq!(parsed.spec.cluster_ip, None);
+    }
+}

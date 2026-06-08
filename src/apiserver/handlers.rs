@@ -17,9 +17,11 @@ use crate::{
         storage::{PodStore, ResourceStore, StoreError},
         watch::stream_events,
     },
+    endpoints::Endpoints,
     node::{Node, NodeStatus},
     pod::{Pod, PodStatus},
     replicaset::{ReplicaSet, ReplicaSetStatus},
+    service::Service,
 };
 
 /// Shared handler state. `Arc<PodStore>` so every handler (and every spawned
@@ -31,6 +33,8 @@ pub struct AppState {
     pub store: Arc<PodStore>,
     pub rs_store: Arc<ResourceStore<ReplicaSet>>,
     pub node_store: Arc<ResourceStore<Node>>,
+    pub svc_store: Arc<ResourceStore<Service>>,
+    pub ep_store: Arc<ResourceStore<Endpoints>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -572,6 +576,224 @@ pub async fn replace_node_status(
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
 
+// Cluster service CIDR is 10.96.0.0/16; service index n -> 10.96.0.n. Persistent
+// counter in sled, mirroring NODE_CIDR_COUNTER.
+const SERVICE_CIDR_PREFIX: &str = "10.96.0";
+const SVC_CLUSTERIP_COUNTER: &[u8] = b"svc_clusterip_counter";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceList {
+    pub kind: String,
+    pub api_version: String,
+    pub items: Vec<Service>,
+}
+
+impl ServiceList {
+    fn new(items: Vec<Service>) -> Self {
+        Self {
+            kind: "ServiceList".to_string(),
+            api_version: "v1".to_string(),
+            items,
+        }
+    }
+}
+
+fn validate_service(svc: &Service) -> Result<(), ApiError> {
+    if svc.metadata.name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "metadata.name must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn list_or_watch_services(
+    State(state): State<AppState>,
+    Query(params): Query<ListWatchParams>,
+) -> Result<Response, ApiError> {
+    if params.watch.unwrap_or(false) {
+        let from_rv = parse_rv(params.resource_version.as_deref());
+        let stream =
+            stream_events(state.svc_store.clone(), from_rv, |_| true).map(|res| match res {
+                Ok(ev) => {
+                    let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
+                    bytes.push(b'\n');
+                    Ok::<Vec<u8>, std::io::Error>(bytes)
+                }
+                Err(e) => {
+                    warn!(error = %e, "service watch stream error; closing connection");
+                    Err(std::io::Error::other(e.to_string()))
+                }
+            });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .map_err(|e| ApiError::Internal(format!("response build: {e}")))?;
+        Ok(response)
+    } else {
+        let (items, _rv) = state.svc_store.list()?;
+        Ok((StatusCode::OK, Json(ServiceList::new(items))).into_response())
+    }
+}
+
+pub async fn create_service(
+    State(state): State<AppState>,
+    Json(mut svc): Json<Service>,
+) -> Result<Response, ApiError> {
+    validate_service(&svc)?;
+    if svc.spec.cluster_ip.is_none() && state.svc_store.get(&svc.metadata.name)?.is_none() {
+        let idx = state.svc_store.next_index(SVC_CLUSTERIP_COUNTER)?;
+        if idx > 255 {
+            return Err(ApiError::Internal(format!(
+                "service ClusterIP space exhausted (index {idx} exceeds 255)"
+            )));
+        }
+        svc.spec.cluster_ip = Some(format!("{SERVICE_CIDR_PREFIX}.{idx}"));
+    }
+    let created = state.svc_store.create(svc)?;
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+
+pub async fn get_service(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let svc = state
+        .svc_store
+        .get(&name)?
+        .ok_or_else(|| ApiError::NotFound(name.clone()))?;
+    Ok((StatusCode::OK, Json(svc)).into_response())
+}
+
+pub async fn replace_service_spec(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(svc): Json<Service>,
+) -> Result<Response, ApiError> {
+    validate_service(&svc)?;
+    if svc.metadata.name != name {
+        return Err(ApiError::BadRequest(format!(
+            "name in body ({}) does not match URL path ({name})",
+            svc.metadata.name
+        )));
+    }
+    let updated = state.svc_store.replace_spec(&name, svc)?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
+pub async fn delete_service(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<RvParams>,
+) -> Result<Response, ApiError> {
+    let rv = params
+        .resource_version
+        .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    let deleted = state.svc_store.delete(&name, &rv)?;
+    Ok((StatusCode::OK, Json(deleted)).into_response())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointsList {
+    pub kind: String,
+    pub api_version: String,
+    pub items: Vec<Endpoints>,
+}
+
+impl EndpointsList {
+    fn new(items: Vec<Endpoints>) -> Self {
+        Self {
+            kind: "EndpointsList".to_string(),
+            api_version: "v1".to_string(),
+            items,
+        }
+    }
+}
+
+pub async fn list_or_watch_endpoints(
+    State(state): State<AppState>,
+    Query(params): Query<ListWatchParams>,
+) -> Result<Response, ApiError> {
+    if params.watch.unwrap_or(false) {
+        let from_rv = parse_rv(params.resource_version.as_deref());
+        let stream =
+            stream_events(state.ep_store.clone(), from_rv, |_| true).map(|res| match res {
+                Ok(ev) => {
+                    let mut bytes = serde_json::to_vec(&ev).map_err(std::io::Error::other)?;
+                    bytes.push(b'\n');
+                    Ok::<Vec<u8>, std::io::Error>(bytes)
+                }
+                Err(e) => {
+                    warn!(error = %e, "endpoints watch stream error; closing connection");
+                    Err(std::io::Error::other(e.to_string()))
+                }
+            });
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stream))
+            .map_err(|e| ApiError::Internal(format!("response build: {e}")))?;
+        Ok(response)
+    } else {
+        let (items, _rv) = state.ep_store.list()?;
+        Ok((StatusCode::OK, Json(EndpointsList::new(items))).into_response())
+    }
+}
+
+pub async fn create_endpoints(
+    State(state): State<AppState>,
+    Json(ep): Json<Endpoints>,
+) -> Result<Response, ApiError> {
+    if ep.metadata.name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "metadata.name must not be empty".into(),
+        ));
+    }
+    let created = state.ep_store.create(ep)?;
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+
+pub async fn get_endpoints(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError> {
+    let ep = state
+        .ep_store
+        .get(&name)?
+        .ok_or_else(|| ApiError::NotFound(name.clone()))?;
+    Ok((StatusCode::OK, Json(ep)).into_response())
+}
+
+pub async fn replace_endpoints(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(ep): Json<Endpoints>,
+) -> Result<Response, ApiError> {
+    if ep.metadata.name != name {
+        return Err(ApiError::BadRequest(format!(
+            "name in body ({}) does not match URL path ({name})",
+            ep.metadata.name
+        )));
+    }
+    let updated = state.ep_store.replace_spec(&name, ep)?;
+    Ok((StatusCode::OK, Json(updated)).into_response())
+}
+
+pub async fn delete_endpoints(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<RvParams>,
+) -> Result<Response, ApiError> {
+    let rv = params
+        .resource_version
+        .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    let deleted = state.ep_store.delete(&name, &rv)?;
+    Ok((StatusCode::OK, Json(deleted)).into_response())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +819,8 @@ mod tests {
         Arc<PodStore>,
         Arc<ResourceStore<ReplicaSet>>,
         Arc<ResourceStore<Node>>,
+        Arc<ResourceStore<Service>>,
+        Arc<ResourceStore<Endpoints>>,
     ) {
         let db = sled::Config::default()
             .temporary(true)
@@ -605,17 +829,21 @@ mod tests {
         let pod_store = Arc::new(PodStore::from_db(db.clone()).expect("pod store"));
         let rs_store =
             Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
-        let node_store = Arc::new(ResourceStore::<Node>::from_db(db).expect("node store"));
+        let node_store = Arc::new(ResourceStore::<Node>::from_db(db.clone()).expect("node store"));
+        let svc_store = Arc::new(ResourceStore::<Service>::from_db(db.clone()).expect("svc store"));
+        let ep_store = Arc::new(ResourceStore::<Endpoints>::from_db(db).expect("ep store"));
         let app = router(AppState {
             store: pod_store.clone(),
             rs_store: rs_store.clone(),
             node_store: node_store.clone(),
+            svc_store: svc_store.clone(),
+            ep_store: ep_store.clone(),
         });
-        (app, pod_store, rs_store, node_store)
+        (app, pod_store, rs_store, node_store, svc_store, ep_store)
     }
 
     fn setup() -> (axum::Router, Arc<PodStore>) {
-        let (app, pod_store, _rs, _node) = setup_full();
+        let (app, pod_store, _rs, _node, _svc, _ep) = setup_full();
         (app, pod_store)
     }
 
@@ -889,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_create_returns_201_with_apiserver_fields() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let res = app
             .oneshot(json_req(
                 Method::POST,
@@ -908,7 +1136,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_create_rejects_empty_selector() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let mut rs = make_replicaset("web", 3);
         rs.spec.selector.match_labels.clear(); // empty selector → matches everything
         let res = app
@@ -922,7 +1150,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_list_wraps_in_replicasetlist() {
-        let (app, _, rs_store, _node) = setup_full();
+        let (app, _, rs_store, _node, _, _) = setup_full();
         rs_store.create(make_replicaset("a", 1)).unwrap();
         rs_store.create(make_replicaset("b", 2)).unwrap();
         let res = app
@@ -938,7 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_get_missing_returns_404() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let res = app
             .oneshot(empty_req(Method::GET, "/api/v1/replicasets/nope"))
             .await
@@ -948,7 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn rs_replace_status_persists_replica_counts() {
-        let (app, _, rs_store, _node) = setup_full();
+        let (app, _, rs_store, _node, _, _) = setup_full();
         rs_store.create(make_replicaset("web", 3)).unwrap(); // rv=1
         let status = ReplicaSetStatus {
             replicas: 3,
@@ -974,7 +1202,7 @@ mod tests {
     /// interleaved creates get strictly increasing rvs across BOTH kinds.
     #[tokio::test]
     async fn pod_and_rs_share_global_resource_version() {
-        let (_app, pod_store, rs_store, _node) = setup_full();
+        let (_app, pod_store, rs_store, _node, _, _) = setup_full();
         let p = pod_store.create(make_pod("web")).unwrap(); // rv=1
         let rs = rs_store.create(make_replicaset("web", 1)).unwrap(); // rv=2
         assert_eq!(p.metadata.resource_version.as_deref(), Some("1"));
@@ -1001,9 +1229,166 @@ mod tests {
         serde_json::from_slice(&bytes).expect("valid Node body")
     }
 
+    fn make_service(name: &str) -> Service {
+        Service {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            metadata: crate::meta::ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: crate::service::ServiceSpec {
+                port: 80,
+                target_port: 8080,
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn body_service(res: Response) -> Service {
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).expect("valid Service body")
+    }
+
+    fn make_endpoints(name: &str) -> Endpoints {
+        Endpoints {
+            api_version: "v1".into(),
+            kind: "Endpoints".into(),
+            metadata: crate::meta::ObjectMeta {
+                name: name.into(),
+                ..Default::default()
+            },
+            addresses: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn service_create_assigns_clusterip_get_list() {
+        let (app, ..) = setup_full();
+        let res = app
+            .clone()
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/services",
+                &make_service("web"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let created = body_service(res).await;
+        // First service → first ClusterIP from 10.96.0.0/16.
+        assert_eq!(created.spec.cluster_ip.as_deref(), Some("10.96.0.0"));
+
+        let res = app
+            .oneshot(empty_req(Method::GET, "/api/v1/services"))
+            .await
+            .unwrap();
+        let body = body_value(res).await;
+        assert_eq!(body["kind"], "ServiceList");
+        assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    }
+
+    /// Two services get distinct ClusterIPs; re-applying a service keeps its VIP
+    /// (the counter isn't burned by re-registration) — mirrors the PodCIDR tests.
+    #[tokio::test]
+    async fn service_clusterips_are_distinct_and_stable() {
+        let (app, ..) = setup_full();
+        let a = body_service(
+            app.clone()
+                .oneshot(json_req(
+                    Method::POST,
+                    "/api/v1/services",
+                    &make_service("a"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(a.spec.cluster_ip.as_deref(), Some("10.96.0.0"));
+
+        // Re-POST "a" → 409, no IP burned.
+        let res = app
+            .clone()
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/services",
+                &make_service("a"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // "b" proves the counter advanced by exactly one (not two).
+        let b = body_service(
+            app.oneshot(json_req(
+                Method::POST,
+                "/api/v1/services",
+                &make_service("b"),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(b.spec.cluster_ip.as_deref(), Some("10.96.0.1"));
+    }
+
+    /// A service that brings its own ClusterIP keeps it (apiserver fills the gap,
+    /// doesn't override).
+    #[tokio::test]
+    async fn service_preserves_explicit_clusterip() {
+        let (app, ..) = setup_full();
+        let mut svc = make_service("web");
+        svc.spec.cluster_ip = Some("10.96.0.99".into());
+        let created = body_service(
+            app.oneshot(json_req(Method::POST, "/api/v1/services", &svc))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created.spec.cluster_ip.as_deref(), Some("10.96.0.99"));
+    }
+
+    #[tokio::test]
+    async fn service_create_rejects_empty_name() {
+        let (app, ..) = setup_full();
+        let res = app
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/services",
+                &make_service(""),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn endpoints_create_get_list() {
+        let (app, ..) = setup_full();
+        let mut ep = make_endpoints("web");
+        ep.addresses.push(crate::endpoints::EndpointAddress {
+            ip: "10.244.0.2".into(),
+            port: 8080,
+        });
+        let res = app
+            .clone()
+            .oneshot(json_req(Method::POST, "/api/v1/endpoints", &ep))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+
+        let res = app
+            .oneshot(empty_req(Method::GET, "/api/v1/endpoints/web"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_value(res).await;
+        assert_eq!(body["addresses"][0]["ip"], "10.244.0.2");
+    }
+
     #[tokio::test]
     async fn node_create_get_list() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let res = app
             .clone()
             .oneshot(json_req(
@@ -1029,7 +1414,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_replace_status_sets_heartbeat() {
-        let (app, _, _, node_store) = setup_full();
+        let (app, _, _, node_store, _, _) = setup_full();
         node_store.create(make_node("node-a")).unwrap(); // rv=1
         let status = NodeStatus {
             ready: true,
@@ -1057,18 +1442,26 @@ mod tests {
     /// disjoint /24 slices — the IPAM coordination guarantee.
     #[tokio::test]
     async fn create_node_assigns_distinct_pod_cidrs() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let a = body_node(
             app.clone()
-                .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+                .oneshot(json_req(
+                    Method::POST,
+                    "/api/v1/nodes",
+                    &make_node("node-a"),
+                ))
                 .await
                 .unwrap(),
         )
         .await;
         let b = body_node(
-            app.oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-b")))
-                .await
-                .unwrap(),
+            app.oneshot(json_req(
+                Method::POST,
+                "/api/v1/nodes",
+                &make_node("node-b"),
+            ))
+            .await
+            .unwrap(),
         )
         .await;
         assert_eq!(a.spec.pod_cidr.as_deref(), Some("10.244.0.0/24"));
@@ -1079,10 +1472,14 @@ mod tests {
     /// does NOT consume a CIDR index (the next new node still gets .1, not .2).
     #[tokio::test]
     async fn create_node_reregistration_does_not_burn_a_cidr() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let a = body_node(
             app.clone()
-                .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+                .oneshot(json_req(
+                    Method::POST,
+                    "/api/v1/nodes",
+                    &make_node("node-a"),
+                ))
                 .await
                 .unwrap(),
         )
@@ -1092,16 +1489,24 @@ mod tests {
         // Re-register node-a → rejected, no allocation.
         let res = app
             .clone()
-            .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-a")))
+            .oneshot(json_req(
+                Method::POST,
+                "/api/v1/nodes",
+                &make_node("node-a"),
+            ))
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::CONFLICT);
 
         // node-b proves the counter wasn't advanced by the failed re-register.
         let b = body_node(
-            app.oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("node-b")))
-                .await
-                .unwrap(),
+            app.oneshot(json_req(
+                Method::POST,
+                "/api/v1/nodes",
+                &make_node("node-b"),
+            ))
+            .await
+            .unwrap(),
         )
         .await;
         assert_eq!(b.spec.pod_cidr.as_deref(), Some("10.244.1.0/24"));
@@ -1111,7 +1516,7 @@ mod tests {
     /// the gap, it doesn't override an explicit assignment.
     #[tokio::test]
     async fn create_node_preserves_explicit_pod_cidr() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let mut node = make_node("node-x");
         node.spec.pod_cidr = Some("10.244.7.0/24".into());
         let created = body_node(
@@ -1125,7 +1530,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_create_rejects_empty_name() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let res = app
             .oneshot(json_req(Method::POST, "/api/v1/nodes", &make_node("")))
             .await
@@ -1141,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_sets_node_name() {
-        let (app, store, _, _) = setup_full();
+        let (app, store, _, _, _, _) = setup_full();
         store.create(make_pod("web")).unwrap(); // unscheduled: node_name None
         assert!(store.get("web").unwrap().unwrap().spec.node_name.is_none());
 
@@ -1165,7 +1570,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_missing_pod_returns_404() {
-        let (app, _, _, _) = setup_full();
+        let (app, _, _, _, _, _) = setup_full();
         let res = app
             .oneshot(json_req(
                 Method::POST,
@@ -1179,7 +1584,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_empty_node_name_returns_400() {
-        let (app, store, _, _) = setup_full();
+        let (app, store, _, _, _, _) = setup_full();
         store.create(make_pod("web")).unwrap();
         let res = app
             .oneshot(json_req(
@@ -1194,7 +1599,7 @@ mod tests {
 
     #[tokio::test]
     async fn binding_is_idempotent() {
-        let (app, store, _, _) = setup_full();
+        let (app, store, _, _, _, _) = setup_full();
         store.create(make_pod("web")).unwrap();
         for _ in 0..2 {
             let res = app
@@ -1219,7 +1624,7 @@ mod tests {
     /// router mis-dispatched, we'd get 405/404 instead of a successful bind.
     #[tokio::test]
     async fn binding_route_does_not_collide_with_pod_name_route() {
-        let (app, store, _, _) = setup_full();
+        let (app, store, _, _, _, _) = setup_full();
         store.create(make_pod("web")).unwrap();
         let res = app
             .oneshot(json_req(
@@ -1265,7 +1670,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_filters_by_node_name() {
-        let (app, store, _, _) = setup_full();
+        let (app, store, _, _, _, _) = setup_full();
         store.create(make_pod_on("a", "node-a")).unwrap();
         store.create(make_pod_on("b", "node-b")).unwrap();
         store.create(make_pod("c")).unwrap(); // unscheduled (node_name None)
@@ -1295,7 +1700,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_filters_catch_up_and_live_by_node_name() {
-        let (_app, store, _, _) = setup_full();
+        let (_app, store, _, _, _, _) = setup_full();
         // Pre-existing pods: one on node-a, one on node-b.
         store.create(make_pod_on("a", "node-a")).unwrap();
         store.create(make_pod_on("b", "node-b")).unwrap();

@@ -54,7 +54,11 @@ async fn main() -> Result<()> {
     let state = AppState {
         store: Arc::new(PodStore::from_db(db.clone())?),
         rs_store: Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone())?),
-        node_store: Arc::new(ResourceStore::<Node>::from_db(db)?),
+        node_store: Arc::new(ResourceStore::<Node>::from_db(db.clone())?),
+        svc_store: Arc::new(ResourceStore::<my_k8s::service::Service>::from_db(
+            db.clone(),
+        )?),
+        ep_store: Arc::new(ResourceStore::<my_k8s::endpoints::Endpoints>::from_db(db)?),
     };
     let app = router(state);
 

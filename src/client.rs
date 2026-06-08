@@ -352,11 +352,19 @@ mod tests {
         let rs_store =
             Arc::new(ResourceStore::<ReplicaSet>::from_db(db.clone()).expect("rs store"));
         let node_store =
-            Arc::new(ResourceStore::<crate::node::Node>::from_db(db).expect("node store"));
+            Arc::new(ResourceStore::<crate::node::Node>::from_db(db.clone()).expect("node store"));
+        let svc_store = Arc::new(
+            ResourceStore::<crate::service::Service>::from_db(db.clone()).expect("svc store"),
+        );
+        let ep_store = Arc::new(
+            ResourceStore::<crate::endpoints::Endpoints>::from_db(db).expect("ep store"),
+        );
         let app = router(AppState {
             store: store.clone(),
             rs_store,
             node_store,
+            svc_store,
+            ep_store,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

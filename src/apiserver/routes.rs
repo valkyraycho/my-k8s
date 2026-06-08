@@ -4,10 +4,12 @@ use axum::{
 };
 
 use crate::apiserver::handlers::{
-    AppState, bind_pod, create_node, create_pod, create_replicaset, delete_node, delete_pod,
-    delete_replicaset, get_node, get_pod, get_replicaset, list_or_watch_nodes, list_or_watch_pods,
-    list_or_watch_replicasets, replace_node_spec, replace_node_status, replace_pod_spec,
-    replace_pod_status, replace_replicaset_spec, replace_replicaset_status,
+    AppState, bind_pod, create_endpoints, create_node, create_pod, create_replicaset,
+    create_service, delete_endpoints, delete_node, delete_pod, delete_replicaset, delete_service,
+    get_endpoints, get_node, get_pod, get_replicaset, get_service, list_or_watch_endpoints,
+    list_or_watch_nodes, list_or_watch_pods, list_or_watch_replicasets, list_or_watch_services,
+    replace_endpoints, replace_node_spec, replace_node_status, replace_pod_spec,
+    replace_pod_status, replace_replicaset_spec, replace_replicaset_status, replace_service_spec,
 };
 
 /// The REST surface, in one place. Note `get(...).post(...)` chaining attaches
@@ -44,5 +46,25 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/nodes/:name/status", put(replace_node_status))
         .route("/api/v1/pods/:name/binding", post(bind_pod))
+        .route(
+            "/api/v1/services",
+            get(list_or_watch_services).post(create_service),
+        )
+        .route(
+            "/api/v1/services/:name",
+            get(get_service)
+                .put(replace_service_spec)
+                .delete(delete_service),
+        )
+        .route(
+            "/api/v1/endpoints",
+            get(list_or_watch_endpoints).post(create_endpoints),
+        )
+        .route(
+            "/api/v1/endpoints/:name",
+            get(get_endpoints)
+                .put(replace_endpoints)
+                .delete(delete_endpoints),
+        )
         .with_state(state)
 }
