@@ -23,4 +23,5 @@ pub mod reconciler;
 pub mod replicaset;
 pub mod runtime;
 pub mod scheduler;
+pub mod service;
 pub mod store;
