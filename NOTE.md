@@ -12,6 +12,12 @@
 > - **Decision:** a fork in the road and why we picked one branch
 > - **Runbook:** a literal command/step needed to reproduce or operate the thing
 > - **Gotcha:** something that surprised me or burned time
+>
+> **Philosophy call-outs** (the *thought process*, so you can re-derive the design yourself, not just recognize it) appear as blockquotes:
+> - **⚙ Principle** — a transferable, non-K8s-specific engineering law (collected in the [[#Engineering principles, by example|index]]).
+> - **🧭 Design rationale** — the *derivation chain*: problem → the forces in tension → the nearly-forced moves → a reproducible takeaway. "How would I arrive at this design from scratch?"
+> - **🔧 Implementation choice** — why *this* structure/algorithm/ordering among the working alternatives (the engineering judgment one level below architecture).
+> - **🦀 Rust pattern** — why this *type / trait / ownership / lifetime* shape, and the cue for when to reach for it in your own Rust.
 
 ---
 
@@ -78,6 +84,14 @@
   - [[#6. mykubectl IP column|6 · mykubectl IP column]]
   - [[#7. e2e validation (on the VM)|7 · e2e validation]]
   - [[#Phase 5a wrap — what this earned us|Phase 5a wrap]]
+- [[#Phase 5b — Services (ClusterIP, Endpoints, kube-proxy)]]
+  - [[#1. Schema: `Service` + `Endpoints` as two objects (`service.rs`, `endpoints.rs`)|1 · Schema: Service + Endpoints]]
+  - [[#2. apiserver assigns the ClusterIP VIP (`handlers.rs`)|2 · apiserver assigns ClusterIP]]
+  - [[#3. The endpoints controller (`controller/endpoints.rs`)|3 · Endpoints controller]]
+  - [[#4. kube-proxy: the iptables planner (`kube_proxy.rs`)|4 · kube-proxy iptables planner]]
+  - [[#5. mykubectl: services + endpoints|5 · mykubectl svc/endpoints]]
+  - [[#6. e2e validation (on the VM)|6 · e2e validation]]
+  - [[#Phase 5b wrap — what this earned us|Phase 5b wrap]]
 
 ---
 
@@ -100,8 +114,8 @@
 | 3 | Controllers (ReplicaSet) | Kill a pod, controller recreates it ✅ |
 | 4 | Scheduler | Pods distributed across 2+ kubelets ✅ |
 | 5a | Real pod networking | cross-node `wget <pod-ip>:8080` works; IPs survive restart ✅ |
-| 5b | Services & networking | `curl` a Service VIP, traffic load-balances ⬅ **next** |
-| 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC |
+| 5b | Services & networking | `curl` a Service VIP, traffic load-balances ✅ |
+| 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC ⬅ **next** |
 
 Phase 6 explicitly **dropped** "write your own runtime" — already done that in the prior Docker project. Replaced with distributed-systems content where the marginal learning is highest.
 
@@ -153,7 +167,7 @@ Phase 6 explicitly **dropped** "write your own runtime" — already done that in
 
 **Layer 3 — mock-runtime tests.** The kubelet's reconciler is generic over `RuntimeClient`; tests substitute a `MockRuntime` that records calls and serves canned states. This exercises sandbox-lifecycle ordering, CrashLoopBackOff, partial-create rollback, status dedup, and restart recovery — all the orchestration logic — **with no libcontainer, no root, no Linux**. This is the entire payoff of the trait seam (P1 §3): the hard-to-run dependency is mocked, the logic is tested everywhere.
 
-**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **155 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
+**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **178 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
 
 ## Running the automated layers (1–3)
 
@@ -199,7 +213,13 @@ Each entry: the scenario, the key command(s), and the **property** it demonstrat
 - `kill` a kubelet, restart → its pods' **IPs survive** (recovered from apiserver `status.podIP`, re-`reserve()`d into the rebuilt allocator before any fresh allocate). *Proved: IP persistence across kubelet restart — and WHY pod IP lives in `status` (it's the recovery source of truth).*
 - Two bugs this e2e caught (both invisible to layers 1–3): the `ensure_bridge` idempotency race (losing kubelet's `ip addr add` says "already assigned", not "File exists" → crash on startup), and `resync()` using cluster-wide `list_pods()` instead of `list_pods_on_node` (surviving node tried to adopt a dead node's pods). *Lesson: a scoping filter must be threaded through **every** read path — watch, startup, AND resync — not just the obvious ones.*
 
-> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 155 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
+**Phase 5b — Services (ClusterIP load-balancing).** apiserver + controller-manager (now with the endpoints controller) + kube-proxy + 2 kubelets:
+- RS replicas=3 + a Service selecting them → `mykubectl get endpoints` shows all 3 pod IPs; `iptables -t nat -L` shows the KUBE-SVC/KUBE-SEP chains with `0.33333` / `0.50000` / catch-all probabilities + DNAT targets. *Proved: endpoints controller derives membership from selector+phase+IP, and kube-proxy translates it to the correct netfilter ruleset.*
+- **30/30 `curl 10.96.0.0:80`** → spread across all 3 backends, including pods on the *other* node. *Proved: ClusterIP DNAT load-balances end-to-end over the flat bridge (cross-node), with masquerade so replies route back.*
+- scale RS 3→5 → Endpoints + iptables update live → 20/20 curls spread across 5. *Proved: the service→endpoints→iptables pipeline is reactive, not one-shot.*
+- Bugs/env caught only here: `iptables` not installed on the VM (`apt-get install iptables`); the ClusterIP double-guard (re-apply was burning VIPs with only the request-side check); an E0428 `run` vs `run_cmd` name clash; and the reassuring negative result that a correctly-scoped kube-proxy does NOT break SSH (DNAT only matches `10.96.x` VIPs, MASQ only mark `0x4000`). *Lesson: a new privileged dataplane component needs its blast radius reasoned about explicitly — "does my rule match traffic it shouldn't?" is a design question, not a runtime surprise.*
+
+> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 178 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
 
 ---
 
@@ -383,6 +403,10 @@ pub trait RuntimeClient {
 **Comparison to Go.** This is the same move as a Go interface — `type RuntimeClient interface { CreateContainer(...) error; ... }` with a real impl and a mock impl. The difference: in Go any type satisfies the interface implicitly if it has the methods; in Rust you write `impl RuntimeClient for YoukiRuntime` explicitly. Rust's version is checked at compile time and the intent is visible at the impl site.
 
 > **⚙ Principle — program to an interface (a seam), and let testability drive design.** Introducing a trait with *one* real implementation looks like over-engineering until you notice the second consumer it serves: the test suite. The same seam that would let you swap libcontainer for containerd is what lets `MockRuntime` stand in so the entire reconciler is testable without root or Linux. That's not a coincidence — *a boundary clean enough to mock is a boundary clean enough to swap*. Cue: when a layer is hard to test, the design is usually too coupled; reach for a seam, and you'll often find it improves modularity for free. (This is exactly the design pressure that produced real K8s's CRI.)
+>
+> **🧭 Design rationale — how you'd arrive at the trait without knowing CRI exists.** Start from a constraint, not a pattern: *the thing that runs containers needs root + Linux + libcontainer, but I want to test the orchestration logic on my laptop in milliseconds.* Those two facts are in direct tension. The only way to satisfy both is to make the orchestrator depend on an **abstraction** it can talk to, with two implementations behind it — the real one (needs the world) and a fake one (needs nothing). The moment you write that sentence, you've invented the trait; CRI is just the name K8s gives the same forced move. Reproducible takeaway: *when "the real dependency is expensive/privileged" collides with "I want fast, local tests," the resolution is almost always a trait/interface with a real impl + a test double — derive the seam from the tension, don't reach for it as dogma.*
+>
+> **🦀 Rust pattern — trait + generic (`Reconciler<R: RuntimeClient>`) vs `Box<dyn RuntimeClient>`.** Two ways to be polymorphic over the runtime: a generic type parameter (static dispatch, monomorphized per impl) or a trait object (dynamic dispatch through a vtable). We use the **generic** because the runtime is chosen *once at construction* and never changes per call — so there's no need to pay vtable indirection, and monomorphization lets the compiler inline. Reach for `Box<dyn Trait>` instead when you need a *heterogeneous collection* (a `Vec` of different impls) or to *erase the type* across an API boundary. Cue: *one impl chosen at startup → generic; many impls mixed at runtime → `dyn`.*
 
 **Decision — sync, not async.** The underlying syscalls (`fork`, `exec`, `clone`) are synchronous. Wrapping them in `async` buys nothing (there's no I/O to await) and spreads async "color" through code that doesn't need it. The reconciler bridges to async with `block_in_place` at the one boundary where it matters (§10).
 
@@ -520,6 +544,8 @@ This is the single most K8s-distinctive thing in Phase 1. Worth a slow read.
 **The problem it solves.** A Pod is "a group of containers that share one network identity" — same IP, can talk over `localhost`. Someone has to *own* the shared network/IPC/UTS namespaces. The obvious idea — "let the first app container own them, the rest join" — breaks the moment that container crashes and restarts: its namespaces die with it, and every other container in the Pod loses its network.
 
 **The fix — a do-nothing anchor.** Introduce a tiny extra container (`pause`) whose *only* job is to hold the namespaces. App containers join the pause's namespaces, never each other's. The pause never crashes (it just `sleep infinity`s), so the namespaces — and the Pod IP — outlive any number of app-container restarts.
+
+> **🧭 Design rationale — how the pause container is forced by "Pod IP must survive restarts."** Walk it forward. (1) Containers in a Pod must share a network identity → they must share a network namespace. (2) A Linux namespace lives exactly as long as *some process* is in it. (3) So *which* process anchors the shared namespace? If it's one of the app containers, then when that container crashes (and they do — that's why we have restart logic), its namespace dies, and the Pod's IP changes out from under every other container. Contradiction with the requirement. (4) Therefore the anchor must be a process that *never* exits for app reasons — a dedicated do-nothing container. That's the pause. It wasn't a clever trick someone thought up; it's the unique resolution of "shared, restart-stable namespace" against "namespaces die with their last process." Reproducible takeaway: *when a resource's lifetime must outlive the things that use it, give it a dedicated owner whose only job is to stay alive — don't let a volatile participant double as the anchor.*
 ```
    ┌───────────────────────── Pod "web" ──────────────────────────┐
    │                                                               │
@@ -643,6 +669,8 @@ Two properties fall out of this shape for free:
 - **Self-healing** — any drift (a crashed container, a hand-deleted manifest) is just diff that gets corrected on the next tick. Nobody has to *send* a repair command; the loop notices and converges.
 
 > **⚙ Principle — level-triggered beats edge-triggered for reliability.** An *edge-triggered* design reacts to events ("a Pod was deleted → recreate it"); if it ever misses an event, it's permanently wrong. A *level-triggered* design reacts to the *current gap between desired and actual* ("I want 3, I see 2 → make 1"), recomputed from full state every tick — so a missed or duplicated trigger costs you nothing but a little latency. This single choice is why K8s self-heals, and it recurs everywhere: the kubelet here, the status reporter (P2 §8), the ReplicaSet controller (P3). Cue: *whenever you're tempted to handle "the event," ask instead "what's the difference between what I want and what is?" and drive that to zero — events become mere hints to recheck, not facts you must not miss.*
+>
+> **🧭 Design rationale — how you'd arrive at the reconcile loop from a reliability requirement.** Suppose you started naive: "on each watch event, do the matching action." Now ask the failure question *first* (the engineer's habit): what if an event is dropped, duplicated, or arrives out of order? Networks guarantee none of those won't happen. The edge-triggered design is then *unfixable* — a lost "deleted" event means a pod never gets recreated, forever. The only robust escape is to stop trusting events as facts and instead treat them as *hints to go re-observe reality*, then act on the diff. That reframing — from "apply this delta" to "observe everything, compute the gap, close it" — **is** the reconcile loop; it wasn't designed, it was forced by taking unreliable delivery seriously. Reproducible takeaway: *design the failure path first; if "what if I miss a message?" has no good answer, you're edge-triggered and need to flip to level-triggered.*
 
 **Concept — the three-way diff is plain set arithmetic.** Keys are Pod names:
 ```
@@ -700,7 +728,7 @@ let state = match store.get_mut(name) { Some(s) => s, None => return Ok(()) };
 let s = runtime.container_state(&id)?;
 let tracker = restart_state.entry(id.clone()).or_insert_with(/* ... */); // upsert idiom
 ```
-> The borrow checker tracks borrows per-field once you *name* the fields via `let Self { .. } = self`, but can't see through a method call like `self.store.get_mut()` (which borrows the whole `self`). This destructure is the idiomatic fix — a real production pattern, not a workaround. `..` ignores the fields this function doesn't touch.
+> **🦀 Rust pattern — destructure `self` for disjoint field borrows.** The borrow checker tracks borrows *per field* once you name the fields via `let Self { store, runtime, restart_state, .. } = self` — but it CANNOT see through a method call like `self.store.get_mut()`, which conservatively borrows all of `*self`. So the fix isn't `unsafe` or `RefCell`; it's giving the checker the field-level view it needs by destructuring up front. `..` ignores untouched fields. Cue: *when you need `&mut` to several fields of one struct at once and the checker complains, destructure `self` into named field bindings rather than reaching for interior mutability — it's the zero-cost, idiomatic resolution.*
 
 **Gotcha — restart_state grows unboundedly without explicit cleanup.** When a pod is removed (`remove_pod`), we explicitly delete the tracker entries for its containers (`reconciler.rs:168-171`). Otherwise the map would grow forever across pod churn. The test `remove_pod_clears_restart_trackers` pins this down.
 
@@ -903,6 +931,8 @@ This is our **etcd**. The single most important Phase 2 concept lives here.
 This is lost-update prevention *without locks*: a read-modify-write that fails loudly instead of silently clobbering. Real K8s does exactly this; the rv is opaque to clients (they just echo it back).
 
 > **⚙ Principle — optimistic concurrency for contended shared state.** Two ways to stop concurrent writers from clobbering each other: *pessimistic* (take a lock, block everyone else) or *optimistic* (let everyone proceed, attach a version, reject the write whose version is stale, make the loser retry). Optimistic wins when conflicts are *rare* — no lock to hold, no deadlocks, no blocking, and it works across a network where you can't hold a lock anyway. The cost is that callers must handle a Conflict and retry (P2 §8). Cue: *for shared state with infrequent contention — especially over a network — prefer a compare-and-set on a version token over a lock; reserve locks for genuinely hot, in-process contention.*
+>
+> **🧭 Design rationale — why a lock was never even an option here.** Don't start from "optimistic vs pessimistic" as a menu; start from the constraint. The writers are *separate processes over HTTP* (kubelet, scheduler, controllers, mykubectl). A lock requires a holder that everyone trusts and that releases on crash — but a client can die mid-write holding the lock, and there's no shared memory to put a mutex in anyway. So pessimistic locking is *structurally unavailable* across a network of independent clients. That leaves "let writes race, detect the conflict after the fact" — which forces a per-object version you compare on write. The `resourceVersion` field isn't a clever choice; it's the only thing that *can* work once you accept "many independent network clients, any of which may vanish." Reproducible takeaway: *when mutators are distributed and crash-prone, lock-based coordination is off the table — reach for versioned compare-and-set, and the version field is mandatory, not optional.*
 
 **Concept — the atomic transaction, in code.** The rv-check and counter-bump must be one indivisible step, or two writers could both pass the check before either bumps. `sled`'s `transaction(closure)` gives that (`replace_spec`):
 ```rust
@@ -917,7 +947,8 @@ let updated = self.db.transaction(|tx| {
 }).map_err(unwrap_txn)?;                                 // ⑤ flatten the 2-layer error
 emit(&self.watch_tx, WatchEventType::Modified, updated.clone()); // ⑥ fan out AFTER commit
 ```
-> **Rust idiom — two-layer transaction error.** Inside the closure, `?`/`Abort` produce `ConflictableTransactionError<StoreError>`; sled wraps that as `TransactionError<StoreError>` (our `Abort` vs sled's `Storage` I/O error). `unwrap_txn` collapses both back into one flat `StoreError` so callers see a single error type. **⑥** the watch event is emitted only after the txn commits, so watchers never see a rolled-back write.
+> **🦀 Rust pattern — two-layer transaction error, collapsed at the boundary.** Inside the closure, `?`/`Abort` produce `ConflictableTransactionError<StoreError>`; sled wraps that as `TransactionError<StoreError>` (our `Abort` vs sled's `Storage` I/O error). `unwrap_txn` collapses both back into one flat `StoreError` so callers see a single error type. Cue: *when a library hands you a nested/wrapped error type at an internal boundary, flatten it to your own domain error at that boundary — don't leak the library's error taxonomy up to every caller.*
+> **🔧 Implementation choice — emit the watch event AFTER the transaction commits, not inside it.** ⑥ is outside the `transaction(...)` closure on purpose. If you fired the event inside and the transaction then *retried* (sled may re-run the closure under contention) or *aborted*, watchers would see an event for a write that never happened — phantom state. Emitting only on the committed result guarantees every watch event corresponds to a durable change. Cue: *publish a change notification only after the change is durably committed; a notification inside the not-yet-committed critical section can describe a write that gets rolled back.*
 
 **Concept — create mints identity and *clobbers* client-supplied server fields.** On `create`, the store overwrites `uid` (fresh UUID), `generation` (=1), `creationTimestamp` (=now), `resourceVersion` (minted), and discards any client-sent `status`. Why: those fields are server-owned. A client must not be able to forge a uid, pin an rv, or pre-seed status. Pinned by `create_clobbers_client_provided_apiserver_fields`.
 
@@ -979,6 +1010,8 @@ pub fn stream_events(store: Arc<PodStore>, from_rv: u64)
 **Concept — `Lagged` → 410 Gone → client must re-list.** The broadcast channel is bounded (256). A client that falls more than 256 events behind gets `RecvError::Lagged`. We *cannot* silently skip — the client's local cache would be permanently wrong. So we terminate the stream with `WatchError::Lagged`; the HTTP layer closes the connection; the client re-lists from scratch and starts a fresh watch. Real K8s returns `410 Gone` with identical meaning: "your resourceVersion is too old to resume from — start over." Pinned by `lagged_receiver_terminates_stream_with_error`.
 
 **Why `async_stream::try_stream!`.** Implementing `Stream`/`poll_next` by hand is fiddly state-machine code. `try_stream!` lets us write the catch-up loop and the live loop as ordinary straight-line async with `yield`; a `?` inside cleanly ends the stream on error. The result is an `impl Stream<Item = Result<WatchEvent, WatchError>>`.
+
+> **🦀 Rust pattern — `try_stream!` + `impl Stream` return for a hand-rolled async iterator.** A `Stream` is the async analogue of `Iterator`; implementing one by hand means writing a `poll_next` state machine that manually tracks "am I in catch-up or live mode?" — error-prone and unreadable. The `try_stream!` macro turns that inside out: you write *normal sequential async code* with `yield` to emit items and `?` to short-circuit, and the macro generates the state machine. The catch: the generated type is **unnameable**, so the function must return `impl Stream<...>` (return-position `impl Trait`), not a concrete type. Cue: *to produce a stream with non-trivial internal control flow, write it as a `try_stream!`/`async_stream!` generator returning `impl Stream`, rather than hand-implementing `poll_next` — reserve the manual impl for when you need a nameable type or zero macro magic.* The `?`-terminates-the-stream behavior is the macro-level mirror of `?` short-circuiting a `Result`-returning fn.
 
 ## 4. HTTP surface — routes + handlers (`src/apiserver/{routes,handlers}.rs`)
 
@@ -1341,6 +1374,10 @@ struct Inner {
 > **⚙ Principle — dedup on identity, carry no payload.** The queue holds *names*, not event data. Ten events for `web` collapse to one `web` key → one reconcile that reads *current* full state. This is what makes the controller level-triggered (§4) and cheap under load. Cue: *enqueue "what changed" (a key), not "what happened" (an event); then re-derive the truth when you process it.*
 >
 > **⚙ Principle — make concurrency invariants explicit in the data model.** The three-set design guarantees, by construction, "never two workers on one key" and "a key re-added mid-flight is reprocessed exactly once, never lost." Those are the hard bugs in concurrent systems, and they're prevented here by *structure*, not by careful timing. Cue: *encode your concurrency guarantees in the types/state, so they hold regardless of scheduling.* (Pinned by `readd_during_processing_requeues_once_on_done`.)
+>
+> **🧭 Design rationale — how you'd arrive at *three* sets.** Start with the naive queue: a `VecDeque` of keys. Now stress it with the real questions. (1) "The same Service fires 50 events in a burst — do I reconcile 50 times?" No → I need to know "is this key already waiting?" → add a `dirty` set, skip enqueue if present. (2) "A key is being processed and a new event for it arrives — if I requeue now, a second worker could grab it concurrently." Bad → I need to know "is this key in flight?" → add a `processing` set; while processing, mark `dirty` but DON'T enqueue. (3) "When processing finishes, did something arrive meanwhile?" → on `done`, if still `dirty`, requeue once. Each set was forced by one concurrency question; the trio is the minimal state that answers all three. Reproducible takeaway: *don't design a concurrent structure top-down from a pattern — interrogate the naive version with "what if two things race here?" and add exactly the state each answer requires.* (This is client-go's `workqueue` rederived from first principles.)
+>
+> **🦀 Rust pattern — `Arc<Mutex<Inner>>` + `tokio::sync::Notify` for a shared async queue.** The queue is shared across informer tasks (producers) and the worker (consumer), so it's `Arc` (shared ownership) wrapping a `Mutex` (the three sets mutate together — one lock over the whole `Inner`, not a lock per set, so the invariants stay atomic). The blocking-`get` uses `Notify`: a worker `await`s `notified()` when the queue is empty, and `add` calls `notify_one()` — async parking without busy-polling. Note it's a `std::sync::Mutex`, not `tokio::sync::Mutex`: the critical section is tiny and never `.await`s while held, so the cheaper sync mutex is correct. Cue: *share-across-tasks = `Arc`; mutate-together = one `Mutex` over the whole struct; wake-without-polling = `Notify`; and prefer `std::sync::Mutex` unless you must hold the lock across an `.await`.*
 
 A separate `RateLimiter` (per-key failure count) + `backoff_for(n)` give **exponential backoff on reconcile errors** — the same saturating-shift math as the kubelet's CrashLoopBackOff (P1 §10), kept independent of queue position.
 
@@ -1417,6 +1454,8 @@ What we did NOT build: Deployments (rolling updates over ReplicaSets), multi-con
                               └ watch pods nodeName=node-a ──► sees it → runs it
 ```
 > **⚙ Principle — separate decision from execution; encode the decision as data.** The scheduler's entire output is one written field. Because the *decision* (where) is decoupled from the *execution* (how), they're independent processes — you can test the scheduler with no kubelet, swap the scheduling algorithm without touching the runtime, and run many kubelets that each only execute their own slice. Cue: *when a system both "chooses" and "does," split them — make the choice a piece of persisted data, and let the doer react to it. Decider and doer then evolve, fail, and scale independently.*
+>
+> **🧭 Design rationale — how you'd arrive at "the scheduler writes a field" instead of "the scheduler starts the container."** The tempting first design: the scheduler picks a node and *tells that node's kubelet* to run the pod (an RPC). Now ask the hard questions. (1) "What if the kubelet is briefly down when the scheduler calls?" → the scheduler must retry, track delivery, handle the kubelet coming back — it's now coupled to kubelet liveness. (2) "What if I want two schedulers, or to swap the algorithm?" → every kubelet now needs to know about schedulers. (3) "How do I test placement?" → I need a fake kubelet to receive the call. Every problem traces to the *direct call*. Remove it: the scheduler instead writes its decision (`nodeName`) into the shared store, and each kubelet — already watching for its own pods (P4 §3) — picks it up. The RPC dissolves; delivery, retry, multi-consumer, and testability all become free properties of the watch you already built. Reproducible takeaway: *when component A needs B to act, prefer "A records the desired outcome in shared state, B reacts via its existing watch" over "A calls B directly" — the indirection through data buys you decoupling, retry-for-free, and testability that a direct call costs you.*
 
 New this phase: `spec.nodeName` (the binding target), a `Node` resource + heartbeat, the **binding subresource**, a server-side **`fieldSelector`** (the ambitious centerpiece), a node-aware kubelet, and a `scheduler` binary. Construction order below.
 
@@ -1491,7 +1530,7 @@ stream_events(state.store.clone(), from_rv, filter)
 ```
 > **⚙ Principle — filter at the source (predicate pushdown).** The same instinct as a SQL `WHERE` running in the database, not in your app: move the predicate to where the data already is, so you transmit only what's wanted. Here it also means each kubelet's watch is isolated to its own node's Pods — less wire traffic, and a natural security/blast-radius boundary. Cue: *when a consumer wants a subset, push the filter toward the producer; shipping everything "and filtering later" wastes bandwidth and leaks data the consumer shouldn't see.*
 >
-> **⚙ Principle (Rust) — capture owned data in a `'static` closure, branch inside.** `F: Fn(&T) -> bool + Send + 'static` is the crux: the closure outlives the request (it lives inside the `try_stream!` generator, on its own task), so it can't borrow — it must `move` and own its captures (the `Option<String>`). And note the design choice: rather than *return one of two different closure types* (which would need `Box<dyn Fn>`), we make **one** closure that captures the `Option` and branches on it — a single concrete type, no allocation, no dynamic dispatch. Cue: *a closure that escapes to another task must own everything it touches (`move` + `'static`); to keep "filter or don't" as one type, capture the choice as data and branch inside, instead of picking between closures.*
+> **🦀 Rust pattern — capture owned data in a `'static` closure, branch inside.** `F: Fn(&T) -> bool + Send + 'static` is the crux: the closure outlives the request (it lives inside the `try_stream!` generator, on its own task), so it can't borrow — it must `move` and own its captures (the `Option<String>`). And note the design choice: rather than *return one of two different closure types* (which would need `Box<dyn Fn>`), we make **one** closure that captures the `Option` and branches on it — a single concrete type, no allocation, no dynamic dispatch. Cue: *a closure that escapes to another task must own everything it touches (`move` + `'static`); to keep "filter or don't" as one type, capture the choice as data and branch inside, instead of picking between closures.*
 >
 > **⚙ Principle — be lenient at the boundary, safe by default.** `parse_node_name_selector` understands exactly one selector (`spec.nodeName=`); anything else returns `None` → no filtering. An unrecognized selector degrades to "show everything," never to an error or an empty result. Cue: *a parser at a system boundary should fall back to a safe, obvious default on input it doesn't understand, rather than failing hard — but make sure the default is the safe one (here, "no filter" can't hide a Pod from a kubelet that needs it).*
 
@@ -1678,6 +1717,8 @@ if let Some(ip) = pod.status.as_ref().and_then(|s| s.pod_ip.as_deref())
 // compute_pod_status(): report pod_ip up so it persists + drives the next recovery.
 ```
 > **⚙ Principle — on recovery, claim known state before minting new state.** The reservation pass runs *before* any fresh allocation, so a restarted kubelet can never hand a live survivor's IP to a new pod. Order matters: reserve-then-allocate is safe; allocate-then-reserve would let a new pod grab `.2` before the survivor's `.2` is reclaimed. Cue: *crash recovery should first re-establish what's already true (reserve existing assignments) and only then make new decisions — rebuild the world before you add to it.* This is the same shape as the kubelet reattaching sandboxes (P2 §7); IP recovery is that pattern applied to addresses.
+>
+> **🔧 Implementation choice — in-memory allocator rebuilt from the apiserver, not persisted to local disk.** The `IpAllocator` keeps its `allocated`/`released` sets purely in memory; on restart they're *reconstructed* by reading each pod's `status.podIP` back from the apiserver and `reserve()`-ing it. We could instead have persisted the allocator state to a local file — but that introduces a second source of truth that can drift from the apiserver (the real record of which pod has which IP). Rebuilding from the apiserver means there's exactly one authority, and the allocator is a derived cache of it. Cue: *don't persist derived state to a second store if you can cheaply rebuild it from the authoritative one on startup — two stores of the same fact will eventually disagree, and reconciling them is its own bug farm.*
 
 ## 6. mykubectl IP column
 
@@ -1694,3 +1735,122 @@ Real pod networking: every pod gets a routable, cluster-unique IPv4 via veth+bri
 What we did NOT build (deferred to 5b): Services (a stable virtual IP), an endpoints controller (tracking which pod IPs back a Service), and the iptables/netfilter DNAT dataplane (the kube-proxy analog). 5a gave Services something real to point at.
 
 **Phase 5b (next) is Services.** Pod IPs are real now but ephemeral — they change as pods come and go. A Service is a stable ClusterIP that load-balances across the current backing pods, which means an endpoints controller (a familiar reconcile loop) feeding iptables DNAT rules (the unfamiliar netfilter part).
+
+---
+
+# Phase 5b — Services (ClusterIP, Endpoints, kube-proxy)
+
+The capstone of Phase 5: a **stable virtual IP** that load-balances across a churning set of backend pods. This section leans hard into the *thought process* — design derivation, implementation judgment, and Rust patterns — because the architecture here is almost entirely re-derivable from forces you've already met.
+
+> **🧭 Design rationale — how you'd arrive at "Service + a separate Endpoints object" from scratch.**
+> **Problem, stated honestly:** pods have IPs now (5a) but they're *ephemeral* — a pod dies, the RS makes a replacement with a new IP. A client can't hold a pod IP. We need a *stable address fronting a changing set of pods*.
+> **Force 1 — decouple the stable from the volatile.** The name (VIP + selector) is durable; the membership (which pod IPs back it right now) churns on every pod birth/death. When one thing is stable and another churns underneath it, the move is **split them into two objects**: `Service` (stable) and `Endpoints` (volatile). Fuse them and every pod churn rewrites the Service — conflating durable intent with disposable fact.
+> **Force 2 — who computes the volatile part?** The endpoint list is *derived* state ("Running pods matching this selector, that have an IP"). Derived state in this system is always produced by a **reconcile loop** — you've built three. So you don't invent a mechanism; the endpoints controller is the controller pattern wearing a fifth hat.
+> **Force 3 — separate the decision from the dataplane.** Something must turn "VIP → these IPs" into actual packet redirection. Not the endpoints controller — same split as scheduler (decide) vs kubelet (execute): the control decision and the kernel packet-rewriting have different privileges, failure modes, and scaling. So a *third* component, **kube-proxy**, watches Endpoints and owns iptables.
+> **Reproducible takeaway:** faced with "stable front / churning back," the moves are nearly forced — *split stable from volatile into two objects; derive the volatile one with the reconcile loop you already have; separate the decision from the dataplane.* You could re-derive the whole Service architecture from those three forces without ever having seen K8s.
+
+```
+   Service (stable: selector, port, clusterIP)         kube-proxy (watches svc+ep)
+        │ selector                                          │ rebuilds iptables nat
+        ▼                                                   ▼
+   endpoints controller ── writes ──► Endpoints ───►  KUBE-SERVICES ─► KUBE-SVC-<h> ─► KUBE-SEP-<h> ─► DNAT pod:port
+   (Running+IP pods matching selector)  (volatile IP list)        (VIP:port)   (pick backend)   (rewrite dest)
+```
+
+## 1. Schema: `Service` + `Endpoints` as two objects (`service.rs`, `endpoints.rs`)
+
+```rust
+pub struct ServiceSpec {
+    pub selector: BTreeMap<String, String>,   // pods matching ALL of these are backends
+    pub port: u16,                            // the VIP listens here (clients hit this)
+    pub target_port: u16,                     // forward to this port on the pod
+    #[serde(rename = "clusterIP", skip_serializing_if = "Option::is_none")]
+    pub cluster_ip: Option<String>,           // VIP, assigned by apiserver; None until then
+}
+// Endpoints is a SEPARATE top-level resource — the derived membership list:
+pub struct Endpoints { /* metadata, */ pub addresses: Vec<EndpointAddress> } // { ip, port }
+```
+> **🦀 Rust pattern — `#[serde(rename = "clusterIP")]` vs `rename_all = "camelCase"`.** The struct uses `camelCase` globally (gives `targetPort` ✓), but `cluster_ip` would camelCase to `clusterIp` — wrong; K8s wire key is `clusterIP` (capital P). A per-field `rename` *overrides* the container rule for the one field that doesn't fit the pattern. Cue: *reach for a field-level `rename` when one field is an exception to an otherwise-correct blanket rule — don't abandon the blanket rule for a hand-written name on every field.*
+> **🔧 Implementation choice — `BTreeMap`, not `HashMap`, for the selector.** Deterministic iteration order → the same selector always serializes to identical bytes, which keeps the dedup-if-unchanged checks (controller §3, proxy §4) honest. A `HashMap`'s random order would produce spurious "changed" diffs. Cue: *if a map's serialized form is ever compared for equality, use a `BTreeMap`.*
+
+## 2. apiserver assigns the ClusterIP VIP (`handlers.rs`)
+
+On `create_service`, the apiserver mints the next VIP from `10.96.0.0/16` via a persistent `svc_clusterip_counter` — *exactly* mirroring `create_node`'s /24 assignment (5a §3).
+> **🧭 Design rationale — the apiserver assigns scarce cluster-unique resources, always.** Both PodCIDRs (per node) and ClusterIPs (per service) must be globally unique. The single component that sees *all* creates of a kind, with a persistent counter, is the apiserver — so uniqueness falls out of "one assigner, one counter" with no coordination. Recognizing this is the same shape as 5a means you write *zero* new design: copy the pattern. Cue: *cluster-wide uniqueness → assign at the one chokepoint that serializes creation (the apiserver), backed by durable state.*
+> **🔧 Implementation choice — the double guard `cluster_ip.is_none() && get().is_none()`.** Re-applying a Service must NOT burn a fresh VIP. The first clause skips if the *incoming* object already carries a VIP; the second skips if one is *already stored*. (A bug caught in testing: with only the first guard, `mykubectl apply` of a VIP-less manifest re-assigned every time — the stored-state check is the load-bearing one.) Cue: *an "assign on first create" path must check persisted state, not just the request, or idempotent re-apply silently leaks the resource.*
+
+## 3. The endpoints controller (`controller/endpoints.rs` + `endpoints_manager.rs`)
+
+A reconcile loop, keyed by Service name: list pods, keep those matching the selector that are **Running with an IP**, write the sorted IP list as the Service's `Endpoints`.
+```rust
+pub async fn reconcile(svc_name: &str, client: &Client) -> Result<()> {
+    let Some(svc) = client.get_service(svc_name).await? else {
+        // Service gone → delete its Endpoints (cascade). Then done.
+        /* delete endpoints if present */ return Ok(());
+    };
+    let mut addresses = client.list_pods().await?.into_iter()
+        .filter(|p| pod_matches(p, &svc.spec.selector))
+        .filter_map(|p| backend_ip(&p).map(|ip| EndpointAddress { ip, port: svc.spec.target_port }))
+        .collect::<Vec<_>>();
+    addresses.sort_by(|a, b| a.ip.cmp(&b.ip));      // deterministic order
+    write_endpoints(svc_name, addresses, client).await   // dedup: skip write if unchanged
+}
+fn backend_ip(pod: &Pod) -> Option<String> {       // Running AND has an IP, else None
+    let s = pod.status.as_ref()?;
+    (s.phase == PodPhase::Running).then(|| s.pod_ip.clone()).flatten()
+}
+```
+> **🦀 Rust pattern — `filter_map` + `Option`-returning helper = "select and transform, dropping misses" in one pass.** `backend_ip` returns `Option<String>` (a pod is a backend only if Running *and* it reported an IP — a Running-but-IP-less pod would be a DNAT black hole). `filter_map` keeps the `Some`s and discards the `None`s, fusing the "is it eligible?" filter and the "extract its IP" map into one iterator step. Cue: *when a predicate and an extraction share logic ("is it valid? and if so, give me the value"), express it as one `Option`-returning fn + `filter_map`, not a `.filter().map()` that recomputes.*
+> **⚙ Principle — break the feedback loop with dedup (again).** `write_endpoints` reads the current Endpoints and *returns without writing if the address list is unchanged*. Writing unconditionally would emit an Endpoints MODIFIED event → kube-proxy resync → (and if anything re-enqueued the controller) an endless churn. Same guard as the RS status-write (P3) and kubelet status push (P2 §8). Cue: *any reconcile that writes a derived object must compare-before-write, or it feeds its own watch.*
+> **🧭 Design rationale — why pods carry no back-pointer to Services (and what that costs).** A Pod has `ownerReferences` to its ReplicaSet (a direct link) but *nothing* pointing at Services — because Service membership is by *label selector*, a late-bound query, not ownership. Cost: to map a Pod event → affected Services, `services_for_pod` must scan *all* Services and test each selector (no direct lookup). That's the deliberate trade of label-selection: maximal flexibility (a pod can join any service by wearing the right label, even retroactively) paid for with O(services) fan-out per pod event. Cue: *selector-based association buys loose coupling and late binding; the bill is a scan to invert it — fine at small scale, the thing real K8s adds indexes for at large scale.*
+
+## 4. kube-proxy: the iptables planner (`kube_proxy.rs`)
+
+The dataplane. A new root binary that watches Services + Endpoints and programs `iptables` so packets to a ClusterIP get DNAT'd to a backend pod. The heart is a **pure** planner:
+```rust
+pub fn plan_rules(services: &[Service], endpoints: &[Endpoints]) -> Vec<Vec<String>> {
+    let mut rules = vec![args(&["-F", KUBE_SERVICES])];      // flush + rebuild from scratch
+    for svc in services {
+        let Some(vip) = svc.spec.cluster_ip.as_deref() else { continue };   // no VIP → skip
+        let addrs = /* this service's Endpoints addresses */;
+        if addrs.is_empty() { continue; }                   // no backends → no DNAT
+        let n = addrs.len();
+        for (i, ep) in addrs.iter().enumerate() {
+            // SEP chain: mark-for-masq, then DNAT to the pod
+            rules.push(args(&["-A", &sep, "-j", KUBE_MARK_MASQ]));
+            rules.push(args(&["-A", &sep, "-p","tcp","-j","DNAT","--to-destination", &fmt(ep)]));
+            // SVC chain: probabilistic jump to each SEP
+            if i < n - 1 {
+                let prob = format!("{:.5}", 1.0 / (n - i) as f64);          // 1/N, 1/(N-1), ...
+                rules.push(args(&["-A", &svc, "-m","statistic","--mode","random","--probability",&prob,"-j",&sep]));
+            } else {
+                rules.push(args(&["-A", &svc, "-j", &sep]));                // last = catch-all
+            }
+        }
+        rules.push(args(&["-A", KUBE_SERVICES, "-d", vip, "--dport", &port, "-j", &svc]));
+    }
+    rules
+}
+```
+> **🧭 Design rationale — declining probabilities `1/(N-i)`, not uniform `1/N`.** iptables rules are evaluated *in order*; a `--probability p` rule fires with chance `p`, else falls through to the next. To get a uniform 1/N split across N backends from sequential coin-flips, each rule must be conditioned on "we got here, so the earlier ones didn't fire." The math: 1st rule 1/N, 2nd 1/(N-1) (of the remaining N-1), … last is an unconditional catch-all (probability 1). Multiply it out and every backend gets exactly 1/N. Cue: *when you turn a parallel "pick one of N uniformly" into a sequential fall-through chain, the per-step probability must be conditional — `1/(remaining)`, not `1/N` — and the final step is deterministic.*
+> **🔧 Implementation choice — rebuild the entire ruleset every sync; collapse all events to one `SYNC_KEY`.** Every Service/Endpoints change enqueues the same constant key, and the worker flushes `KUBE-SERVICES` and re-plans everything. Why not surgically patch the one changed rule? Because *idempotent full-rebuild* is dramatically simpler to get right than incremental diffing of kernel state — no "which rules are stale?" bookkeeping, the desired state is always computed fresh from the API objects, and a missed event self-heals on the next sync. The cost (re-applying all rules) is negligible at this scale. Cue: *prefer "recompute the whole desired state and apply it" over "compute and apply a delta" until the full rebuild actually hurts — level-triggered beats edge-triggered for the dataplane too.*
+> **🦀 Rust pattern — a pure `plan_rules(...) -> Vec<Vec<String>>` split from the `#[cfg(not(test))]` executor.** The planner returns iptables invocations *as data* (argv vectors); a separate `apply_rules` (compiled out of tests) actually shells out. So the entire load-balancing logic — chain structure, probabilities, skip-empty rules — is unit-tested with plain `assert!`s on strings, no root, no iptables. Cue: *to test code whose effect is a side-effecting command, have the logic RETURN the command as data and let a thin, separately-compiled layer execute it — "functional core, imperative shell."* (This is the same seam as `RuntimeClient` and the 5a allocator, applied to shell-outs.)
+> **⚙ Gotcha — chain names are capped at 28 chars.** `KUBE-SVC-<16 hex of hash>` = 25 chars, under the limit; same `short_hash` trick as veth names (5a §4). And base chains use the `iptables -C` "check" idiom for idempotent hooking (add the jump only if not already present). Env note: the VM needed `apt-get install iptables` — it wasn't present.
+
+## 5. mykubectl: services + endpoints
+
+`mykubectl apply` detects `kind` (Service vs Pod vs ReplicaSet); `get svc` prints a table (NAME/CLUSTER-IP/PORT/TARGET); `get endpoints` lists the backing IPs; Service apply **preserves the ClusterIP** across re-apply (reads existing, carries the VIP forward — the client-side half of §2's stability guarantee).
+
+## 6. e2e validation (on the VM)
+
+See the [[#How validation works in this project|Validation catalog]] → "Phase 5b" for the full run. In short: an RS of 3 + a Service → the endpoints controller populated Endpoints with all 3 pod IPs → kube-proxy built the iptables chains (verified the `0.33333` / `0.50000` / catch-all probabilities and the DNAT targets) → **30/30 `curl 10.96.0.0:80` load-balanced across all 3 backends** (including cross-node pods) → scaling the RS 3→5 updated Endpoints and iptables live, and 20/20 curls then spread across 5. Bugs/env caught only here: iptables absent on the VM; the ClusterIP double-guard; a `run`-vs-`run_cmd` name clash (E0428); and that a correctly-scoped kube-proxy does *not* break SSH (its DNAT only matches `10.96.x` VIPs, its MASQ only mark `0x4000`).
+
+## Phase 5b wrap — what this earned us
+
+Services: a stable ClusterIP that load-balances across a live-updating set of backend pods, via three cooperating pieces — a two-object schema (stable `Service` / derived `Endpoints`), an endpoints **controller** (the reconcile loop, fifth instance), and **kube-proxy** programming the iptables DNAT dataplane. Phase 5 (networking) is complete: pods have real IPs (5a) *and* a stable way to reach a service of them (5b).
+
+The transferable haul, now framed as *re-derivable moves* ([[#Engineering principles, by example|index]]): split-stable-from-volatile, derive-state-with-the-loop-you-have, separate-decision-from-dataplane, assign-scarce-resources-at-the-chokepoint, functional-core/imperative-shell (pure planner + thin executor), conditional-probability for sequential uniform choice, and (again) dedup-before-write to break feedback loops. The Rust patterns: field-level serde `rename` as a blanket-rule exception, `filter_map` for select-and-transform, and returning commands-as-data for testability.
+
+What we did NOT build: Service types beyond ClusterIP (no NodePort/LoadBalancer), kube-proxy IPVS mode (iptables only), readiness gating of endpoints beyond phase+IP, and DNS (you hit the VIP directly, not a name).
+
+**Phase 6 (next) is the distributed-systems track** — leader election, Raft-backed storage, admission webhooks, a real CNI plugin, or RBAC. The single-instance assumption baked into the controller-manager, scheduler, and kube-proxy (each must run exactly once) is the thread Phase 6's leader-election option would pull.
