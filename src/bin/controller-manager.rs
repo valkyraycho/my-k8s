@@ -8,7 +8,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use my_k8s::{client::Client, controller::manager};
+use my_k8s::{
+    client::Client,
+    controller::{endpoints_manager, manager},
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "controller-manager", version)]
@@ -30,12 +33,14 @@ async fn main() -> Result<()> {
 
     let client = Arc::new(Client::new(args.api_server_url));
     let cancel = CancellationToken::new();
-    let run = tokio::spawn(manager::run(client, cancel.clone()));
+    let run = tokio::spawn(manager::run(client.clone(), cancel.clone()));
+    let ep_run = tokio::spawn(endpoints_manager::run(client.clone(), cancel.clone()));
 
     wait_for_shutdown_signal().await;
     info!("shutdown signal received; cancelling");
     cancel.cancel();
     let _ = run.await;
+    let _ = ep_run.await;
     Ok(())
 }
 
