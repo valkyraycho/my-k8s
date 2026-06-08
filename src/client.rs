@@ -11,8 +11,10 @@ use tokio_util::{
 
 use crate::{
     apiserver::watch::WatchEvent,
+    endpoints::Endpoints,
     node::NodeStatus,
     replicaset::{ReplicaSet, ReplicaSetStatus},
+    service::Service,
 };
 use crate::{
     node::Node,
@@ -270,6 +272,73 @@ impl Client {
         };
         self.watch_resource(&path).await
     }
+
+    pub async fn list_services(&self) -> Result<Vec<Service>> {
+        self.list_resource("/api/v1/services").await
+    }
+
+    pub async fn get_service(&self, name: &str) -> Result<Option<Service>> {
+        self.get_resource(&format!("/api/v1/services/{name}")).await
+    }
+
+    pub async fn create_service(&self, svc: &Service) -> Result<Service> {
+        self.create_resource("/api/v1/services", svc).await
+    }
+
+    pub async fn replace_service_spec(&self, svc: &Service) -> Result<Service> {
+        self.put_resource(&format!("/api/v1/services/{}", svc.metadata.name), svc)
+            .await
+    }
+
+    pub async fn delete_service(&self, name: &str, rv: &str) -> Result<()> {
+        self.delete_resource(&format!("/api/v1/services/{name}?resourceVersion={rv}"))
+            .await
+    }
+
+    pub async fn watch_services(
+        &self,
+        from_rv: Option<&str>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<Service>>> + Send>>> {
+        let path = match from_rv {
+            Some(rv) => format!("/api/v1/services?watch=true&resourceVersion={rv}"),
+            None => "/api/v1/services?watch=true".to_string(),
+        };
+        self.watch_resource(&path).await
+    }
+
+    pub async fn list_endpoints(&self) -> Result<Vec<Endpoints>> {
+        self.list_resource("/api/v1/endpoints").await
+    }
+
+    pub async fn get_endpoints(&self, name: &str) -> Result<Option<Endpoints>> {
+        self.get_resource(&format!("/api/v1/endpoints/{name}"))
+            .await
+    }
+
+    pub async fn create_endpoints(&self, eps: &Endpoints) -> Result<Endpoints> {
+        self.create_resource("/api/v1/endpoints", eps).await
+    }
+
+    pub async fn replace_endpoints(&self, eps: &Endpoints) -> Result<Endpoints> {
+        self.put_resource(&format!("/api/v1/endpoints/{}", eps.metadata.name), eps)
+            .await
+    }
+
+    pub async fn delete_endpoints(&self, name: &str, rv: &str) -> Result<()> {
+        self.delete_resource(&format!("/api/v1/endpoints/{name}?resourceVersion={rv}"))
+            .await
+    }
+
+    pub async fn watch_endpoints(
+        &self,
+        from_rv: Option<&str>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<WatchEvent<Endpoints>>> + Send>>> {
+        let path = match from_rv {
+            Some(rv) => format!("/api/v1/endpoints?watch=true&resourceVersion={rv}"),
+            None => "/api/v1/endpoints?watch=true".to_string(),
+        };
+        self.watch_resource(&path).await
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -356,9 +425,8 @@ mod tests {
         let svc_store = Arc::new(
             ResourceStore::<crate::service::Service>::from_db(db.clone()).expect("svc store"),
         );
-        let ep_store = Arc::new(
-            ResourceStore::<crate::endpoints::Endpoints>::from_db(db).expect("ep store"),
-        );
+        let ep_store =
+            Arc::new(ResourceStore::<crate::endpoints::Endpoints>::from_db(db).expect("ep store"));
         let app = router(AppState {
             store: store.clone(),
             rs_store,
@@ -647,7 +715,10 @@ mod tests {
     #[tokio::test]
     async fn watch_pods_on_node_delivers_only_matching() {
         let (client, _) = spawn_test_apiserver().await;
-        let mut stream = client.watch_pods_on_node("node-a", Some("0")).await.unwrap();
+        let mut stream = client
+            .watch_pods_on_node("node-a", Some("0"))
+            .await
+            .unwrap();
 
         let c2 = Client::new(client.base_url.clone());
         tokio::spawn(async move {
@@ -665,5 +736,108 @@ mod tests {
             .expect("event was Err");
         assert_eq!(event.object.metadata.name, "b");
         assert_eq!(event.object.spec.node_name.as_deref(), Some("node-a"));
+    }
+
+    // ---- Service + Endpoints CRUD over the wire ----
+
+    fn make_service(name: &str) -> crate::service::Service {
+        let mut selector = std::collections::BTreeMap::new();
+        selector.insert("app".into(), name.into());
+        crate::service::Service {
+            api_version: "v1".into(),
+            kind: "Service".into(),
+            metadata: PodMetadata {
+                name: name.into(),
+                ..Default::default()
+            },
+            spec: crate::service::ServiceSpec {
+                selector,
+                port: 80,
+                target_port: 8080,
+                cluster_ip: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn service_create_assigns_clusterip_then_get_list() {
+        let (client, _) = spawn_test_apiserver().await;
+        let created = client.create_service(&make_service("web")).await.unwrap();
+        // The apiserver stamps a ClusterIP the client round-trips back.
+        assert!(created.spec.cluster_ip.is_some(), "expected assigned ClusterIP");
+
+        assert!(client.get_service("web").await.unwrap().is_some());
+        assert!(client.get_service("nope").await.unwrap().is_none());
+        assert_eq!(client.list_services().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn service_replace_spec_and_delete() {
+        let (client, _) = spawn_test_apiserver().await;
+        let created = client.create_service(&make_service("web")).await.unwrap();
+
+        // Replace must echo back the rv (PUT requires the current object).
+        let mut updated = created.clone();
+        updated.spec.port = 9090;
+        let after = client.replace_service_spec(&updated).await.unwrap();
+        assert_eq!(after.spec.port, 9090);
+        // ClusterIP is preserved across a spec replace.
+        assert_eq!(after.spec.cluster_ip, created.spec.cluster_ip);
+
+        let rv = after.metadata.resource_version.unwrap();
+        client.delete_service("web", &rv).await.unwrap();
+        assert!(client.get_service("web").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoints_create_replace_get() {
+        use crate::endpoints::{EndpointAddress, Endpoints};
+        let (client, _) = spawn_test_apiserver().await;
+
+        let ep = Endpoints {
+            api_version: "v1".into(),
+            kind: "Endpoints".into(),
+            metadata: PodMetadata {
+                name: "web".into(),
+                ..Default::default()
+            },
+            addresses: vec![EndpointAddress {
+                ip: "10.244.0.2".into(),
+                port: 8080,
+            }],
+        };
+        let created = client.create_endpoints(&ep).await.unwrap();
+        assert_eq!(created.addresses.len(), 1);
+
+        // Replace with a 2-address set (a scale-up); rv must be echoed.
+        let mut updated = created.clone();
+        updated.addresses.push(EndpointAddress {
+            ip: "10.244.1.3".into(),
+            port: 8080,
+        });
+        let after = client.replace_endpoints(&updated).await.unwrap();
+        assert_eq!(after.addresses.len(), 2);
+
+        let got = client.get_endpoints("web").await.unwrap().unwrap();
+        assert_eq!(got.addresses.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn service_watch_receives_added_event() {
+        let (client, _) = spawn_test_apiserver().await;
+        let mut stream = client.watch_services(Some("0")).await.unwrap();
+
+        let c2 = Client::new(client.base_url.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c2.create_service(&make_service("web")).await.unwrap();
+        });
+
+        let event = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("timed out")
+            .expect("stream ended")
+            .expect("event was Err");
+        assert_eq!(event.object.metadata.name, "web");
     }
 }
