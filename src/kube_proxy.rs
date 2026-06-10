@@ -58,8 +58,7 @@ async fn service_informer(client: Arc<Client>, queue: Arc<WorkQueue>, cancel: Ca
                                     _ = cancel.cancelled() => return,
                                     ev = stream.next() => match ev {
                                         Some(Ok(_)) => queue.add(SYNC_KEY.to_string()),
-                                        Some(Err(e)) => { warn!(error = ?e, "service watch error;
-                reconnecting"); break; }
+                                        Some(Err(e)) => { warn!(error = ?e, "service watch error; reconnecting"); break; }
                                         None => { warn!("service watch closed; reconnecting");
                 break; }
                                     }
@@ -485,7 +484,11 @@ mod tests {
     fn three_endpoints_get_declining_probabilities_and_catch_all() {
         let rules = plan_rules(
             &[svc("web", "10.96.0.1", 80, 8080)],
-            &[eps("web", &["10.244.0.2", "10.244.0.3", "10.244.0.4"], 8080)],
+            &[eps(
+                "web",
+                &["10.244.0.2", "10.244.0.3", "10.244.0.4"],
+                8080,
+            )],
         );
         let joined = lines(&rules).join("\n");
 
@@ -522,6 +525,9 @@ mod tests {
         assert!(s.len() <= 28, "svc chain {s:?} too long ({})", s.len());
         assert!(e.len() <= 28, "sep chain {e:?} too long ({})", e.len());
         // Deterministic: same inputs → same name (so re-syncs target same chains).
-        assert_eq!(s, svc_chain_name("a-very-long-service-name-that-would-overflow"));
+        assert_eq!(
+            s,
+            svc_chain_name("a-very-long-service-name-that-would-overflow")
+        );
     }
 }
