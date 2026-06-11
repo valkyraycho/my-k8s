@@ -2,6 +2,7 @@
 //! state machine (`core::RaftNode::step`); persistence, timers, and transport
 //! live in the shell modules around it.
 
+pub mod core;
 pub mod log;
 pub mod message;
 pub mod storage;
