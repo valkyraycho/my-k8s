@@ -21,6 +21,7 @@ pub mod kube_proxy;
 pub mod meta;
 pub mod node;
 pub mod pod;
+pub mod raft;
 pub mod reconciler;
 pub mod replicaset;
 pub mod runtime;
