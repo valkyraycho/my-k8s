@@ -6,3 +6,6 @@ pub mod core;
 pub mod log;
 pub mod message;
 pub mod storage;
+
+#[cfg(test)]
+mod sim_tests;

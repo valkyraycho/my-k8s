@@ -95,10 +95,10 @@ impl RaftNode {
                 self.on_request_vote_resp(from, resp)
             }
             Event::Message(from, Message::AppendEntries(req)) => self.on_append_entries(from, req),
-            Event::Message(_, Message::AppendEntriesResp(_)) => Vec::new(),
-            Event::Propose(_) => vec![Effect::ProposeRejected {
-                leader_hint: self.leader_hint,
-            }],
+            Event::Message(from, Message::AppendEntriesResp(resp)) => {
+                self.on_append_entries_resp(from, resp)
+            }
+            Event::Propose(cmd) => self.on_propose(cmd),
         }
     }
 
@@ -108,7 +108,7 @@ impl RaftNode {
             Role::Leader { .. } => {
                 if self.ticks_since_reset >= HEARTBEAT_TICKS {
                     self.ticks_since_reset = 0;
-                    return self.broadcast_heartbeats();
+                    return self.broadcast_append();
                 }
                 vec![]
             }
@@ -220,26 +220,37 @@ impl RaftNode {
         };
         self.leader_hint = Some(self.id);
         self.ticks_since_reset = 0;
-        self.broadcast_heartbeats()
+        self.broadcast_append()
     }
 
-    fn broadcast_heartbeats(&self) -> Vec<Effect> {
-        self.peers
-            .iter()
-            .map(|&peer| {
-                Effect::Send(
-                    peer,
-                    Message::AppendEntries(AppendEntriesReq {
-                        term: self.current_term,
-                        leader_id: self.id,
-                        prev_log_index: self.log.last_index(),
-                        prev_log_term: self.log.last_term(),
-                        entries: vec![],
-                        leader_commit: self.commit_index,
-                    }),
-                )
-            })
-            .collect()
+    /// AppendEntries for one peer from its next_index — carries everything the
+    /// peer hasn't acked (empty when caught up = pure heartbeat). One mechanism
+    /// = heartbeat + replication + retransmission.
+    fn append_for(&self, peer: NodeId) -> Effect {
+        let next = match &self.role {
+            Role::Leader { next_index, .. } => next_index
+                .get(&peer)
+                .copied()
+                .unwrap_or(self.log.last_index() + 1),
+            _ => self.log.last_index() + 1,
+        };
+
+        let prev_index = next - 1;
+        Effect::Send(
+            peer,
+            Message::AppendEntries(AppendEntriesReq {
+                term: self.current_term,
+                leader_id: self.id,
+                prev_log_index: prev_index,
+                prev_log_term: self.log.term_at(prev_index).unwrap_or(0),
+                entries: self.log.entries_from(next),
+                leader_commit: self.commit_index,
+            }),
+        )
+    }
+
+    fn broadcast_append(&self) -> Vec<Effect> {
+        self.peers.iter().map(|&p| self.append_for(p)).collect()
     }
 
     fn on_append_entries(&mut self, from: NodeId, req: AppendEntriesReq) -> Vec<Effect> {
@@ -315,6 +326,22 @@ impl RaftNode {
         effects
     }
 
+    fn on_propose(&mut self, cmd: Vec<u8>) -> Vec<Effect> {
+        if !matches!(self.role, Role::Leader { .. }) {
+            return vec![Effect::ProposeRejected {
+                leader_hint: self.leader_hint,
+            }];
+        }
+        let index = self.log.append(self.current_term, cmd);
+        let entry = self.log.get(index).expect("just appended").clone();
+        // Durable on the leader BEFORE broadcast — we count ourselves in the
+        // majority, so our copy must survive a crash.
+        let mut effects = vec![Effect::PersistEntries(vec![entry])];
+        effects.extend(self.broadcast_append());
+        effects.extend(self.try_commit()); // single-node cluster commits NOW
+        effects
+    }
+
     /// Emit Apply for everything committed-but-not-yet-applied, in order.
     /// Shared with the leader's commit path (step 5).
     fn advance_applied(&mut self) -> Vec<Effect> {
@@ -326,6 +353,79 @@ impl RaftNode {
             }
         }
         effects
+    }
+
+    fn on_append_entries_resp(&mut self, from: NodeId, resp: AppendEntriesResp) -> Vec<Effect> {
+        let mut effects = vec![];
+        effects.extend(self.maybe_step_down(resp.term));
+
+        if resp.term < self.current_term {
+            return effects;
+        }
+
+        let succeeded = {
+            let Role::Leader {
+                next_index,
+                match_index,
+            } = &mut self.role
+            else {
+                return effects;
+            };
+            if resp.success {
+                // max(): a reordered stale ack can stand still, never regress.
+                let m = match_index.entry(from).or_insert(0);
+                *m = (*m).max(resp.match_index);
+                next_index.insert(from, *m + 1);
+                true
+            } else {
+                // Consistency reject: walk back one and re-probe (floor 1 —
+                // prev becomes the (0,0) sentinel that always matches).
+                let ni = next_index.entry(from).or_insert(2);
+                *ni = ni.saturating_sub(1).max(1);
+                false
+            }
+        };
+        if succeeded {
+            effects.extend(self.try_commit());
+        } else {
+            effects.push(self.append_for(from));
+        }
+        effects
+    }
+
+    /// Advance commit_index to the highest majority-held entry — counting ONLY
+    /// entries of our OWN term (the Figure 8 rule). Older entries commit
+    /// transitively once a current-term entry above them does.
+    fn try_commit(&mut self) -> Vec<Effect> {
+        let new_commit = {
+            let Role::Leader { match_index, .. } = &self.role else {
+                return vec![];
+            };
+            let mut found = self.commit_index;
+            for n in (self.commit_index + 1..=self.log.last_index()).rev() {
+                if self.log.term_at(n) != Some(self.current_term) {
+                    continue; // Figure 8 guard: never count old-term entries
+                }
+
+                let holders = 1 + self
+                    .peers
+                    .iter()
+                    .filter(|p| match_index.get(p).copied().unwrap_or(0) >= n)
+                    .count();
+                if holders >= self.majority() {
+                    found = n;
+                    break;
+                }
+            }
+            found
+        };
+
+        if new_commit > self.commit_index {
+            self.commit_index = new_commit;
+            self.advance_applied()
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -753,5 +853,190 @@ mod tests {
         assert!(matches!(n.role, Role::Follower));
         assert_eq!(n.leader_hint, Some(1));
         assert_eq!(n.current_term, 1, "same term — no bump");
+    }
+
+    // ---- leader replication + commit (step 5) ----
+
+    fn ack(from: NodeId, term: Term, match_index: LogIndex) -> Event {
+        Event::Message(
+            from,
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: true,
+                match_index,
+            }),
+        )
+    }
+
+    fn nack(from: NodeId, term: Term) -> Event {
+        Event::Message(
+            from,
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term,
+                success: false,
+                match_index: 0,
+            }),
+        )
+    }
+
+    /// All AppendEntries sends in the effects, as (peer, request) pairs.
+    fn ae_sends(effects: &[Effect]) -> Vec<(NodeId, AppendEntriesReq)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send(to, Message::AppendEntries(req)) => Some((*to, req.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn applied(effects: &[Effect]) -> Vec<LogIndex> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Apply(entry) => Some(entry.index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn propose_persists_replicates_then_commits_on_majority_ack() {
+        let mut n = make_leader(); // 3-node leader, term 1
+        let effects = n.step(Event::Propose(b"x=5".to_vec()));
+
+        // Persist FIRST, then a broadcast carrying the entry; nothing applied
+        // yet — the entry is replicated, not committed.
+        assert!(matches!(effects[0], Effect::PersistEntries(_)));
+        let sends = ae_sends(&effects);
+        assert_eq!(sends.len(), 2);
+        assert!(sends.iter().all(|(_, req)| req.entries.len() == 1));
+        assert!(applied(&effects).is_empty(), "not committed yet");
+
+        // One ack = me + peer 2 = majority of 3 → commit + apply.
+        let effects = n.step(ack(2, 1, 1));
+        assert_eq!(n.commit_index, 1);
+        assert_eq!(applied(&effects), vec![1]);
+
+        // Bookkeeping advanced for the acking peer.
+        let Role::Leader {
+            next_index,
+            match_index,
+        } = &n.role
+        else {
+            panic!("still leader");
+        };
+        assert_eq!(match_index[&2], 1);
+        assert_eq!(next_index[&2], 2);
+    }
+
+    #[test]
+    fn five_node_commit_waits_for_two_acks() {
+        let mut n = node(1, vec![2, 3, 4, 5], 1);
+        n.step(Event::Tick);
+        n.step(grant_from(2, 1));
+        n.step(grant_from(3, 1)); // leader of 5
+        n.step(Event::Propose(b"x".to_vec()));
+
+        let effects = n.step(ack(2, 1, 1)); // me+2 = 2 of 5 — NOT majority
+        assert_eq!(n.commit_index, 0);
+        assert!(applied(&effects).is_empty());
+
+        let effects = n.step(ack(3, 1, 1)); // me+2+3 = 3 of 5 → commit
+        assert_eq!(n.commit_index, 1);
+        assert_eq!(applied(&effects), vec![1]);
+    }
+
+    #[test]
+    fn single_node_proposes_and_commits_in_one_step() {
+        let mut n = node(1, vec![], 1);
+        n.step(Event::Tick); // instant leader
+        let effects = n.step(Event::Propose(b"solo".to_vec()));
+        // No peers to wait for: persisted AND applied in the same batch.
+        assert_eq!(n.commit_index, 1);
+        assert_eq!(applied(&effects), vec![1]);
+    }
+
+    #[test]
+    fn rejection_walks_next_index_back_and_reprobes_with_more_history() {
+        let mut n = make_leader();
+        for cmd in [b"a".as_slice(), b"b", b"c"] {
+            n.step(Event::Propose(cmd.to_vec()));
+        }
+        n.step(ack(2, 1, 3)); // peer 2 caught up → next_index[2] = 4
+
+        // Now a (contrived) consistency reject from 2 → walk back to 3 and
+        // immediately re-probe carrying entries from 3.
+        let effects = n.step(nack(2, 1));
+        let sends = ae_sends(&effects);
+        assert_eq!(sends.len(), 1);
+        let (to, req) = &sends[0];
+        assert_eq!(*to, 2);
+        assert_eq!(req.prev_log_index, 2);
+        assert_eq!(req.entries.len(), 1, "carries everything from new next_index");
+        assert_eq!(req.entries[0].index, 3);
+
+        // Repeated rejects floor at next_index = 1 (prev = the (0,0) sentinel).
+        n.step(nack(2, 1));
+        let effects = n.step(nack(2, 1));
+        let (_, req) = &ae_sends(&effects)[0];
+        assert_eq!(req.prev_log_index, 0);
+        assert_eq!(req.entries.len(), 3, "full history from index 1");
+    }
+
+    #[test]
+    fn stale_term_ack_is_ignored() {
+        let mut n = make_leader(); // term 1
+        n.step(Event::Propose(b"x".to_vec()));
+        // A reply from some ancient term-0 exchange claims match=5: ignore it.
+        let effects = n.step(ack(2, 0, 5));
+        assert!(effects.is_empty());
+        assert_eq!(n.commit_index, 0, "stale ack must not commit anything");
+    }
+
+    /// THE Figure 8 test: an old-term entry on a majority must NOT commit by
+    /// counting — only transitively, once a current-term entry commits.
+    #[test]
+    fn figure8_old_term_entry_commits_only_transitively() {
+        // Node 1 in a 5-node cluster holds idx1 from old term 2, and now wins
+        // an election for term 4.
+        let mut n = node(1, vec![2, 3, 4, 5], 1);
+        n.log.append(2, b"old".to_vec());
+        n.current_term = 3;
+        n.step(Event::Tick); // candidacy bumps to term 4
+        n.step(grant_from(2, 4));
+        n.step(grant_from(3, 4));
+        assert!(matches!(n.role, Role::Leader { .. }));
+        assert_eq!(n.current_term, 4);
+
+        // Peers 2 and 3 confirm they hold idx1 → a MAJORITY holds it. But it's
+        // a term-2 entry and we're term 4: counting it would be the Figure 8
+        // bug (a term-3 rival could still overwrite it after our crash).
+        n.step(ack(2, 4, 1));
+        let effects = n.step(ack(3, 4, 1));
+        assert_eq!(n.commit_index, 0, "old-term entry must NOT commit by count");
+        assert!(applied(&effects).is_empty());
+
+        // Now replicate one OWN-term entry to the same majority...
+        n.step(Event::Propose(b"new".to_vec())); // idx2, term 4
+        n.step(ack(2, 4, 2));
+        let effects = n.step(ack(3, 4, 2));
+        // ...and idx2 commits, dragging idx1 along TRANSITIVELY.
+        assert_eq!(n.commit_index, 2);
+        assert_eq!(applied(&effects), vec![1, 2], "old entry applies in order, after all");
+    }
+
+    #[test]
+    fn heartbeat_retransmits_to_lagging_peers_only() {
+        let mut n = make_leader();
+        n.step(Event::Propose(b"x".to_vec()));
+        n.step(ack(2, 1, 1)); // peer 2 caught up; peer 3 never acked
+
+        let effects = tick_n(&mut n, HEARTBEAT_TICKS);
+        let sends = ae_sends(&effects);
+        let to_2 = sends.iter().find(|(to, _)| *to == 2).unwrap();
+        let to_3 = sends.iter().find(|(to, _)| *to == 3).unwrap();
+        assert!(to_2.1.entries.is_empty(), "caught-up peer gets pure heartbeat");
+        assert_eq!(to_3.1.entries.len(), 1, "lagging peer gets the entry again");
     }
 }
