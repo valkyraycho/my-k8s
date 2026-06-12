@@ -5,7 +5,9 @@
 pub mod core;
 pub mod log;
 pub mod message;
+pub mod node;
 pub mod storage;
+pub mod transport;
 
 #[cfg(test)]
 mod sim_tests;
