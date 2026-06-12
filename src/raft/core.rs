@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::raft::{
     log::{LogEntry, LogIndex, NodeId, RaftLog, Term},
-    message::{AppendEntriesReq, Message, RequestVoteReq, RequestVoteResp},
+    message::{AppendEntriesReq, AppendEntriesResp, Message, RequestVoteReq, RequestVoteResp},
 };
 
 /// Leader heartbeats every N ticks (shell ticks ~50ms → ~150ms heartbeats).
@@ -38,8 +38,12 @@ pub enum Effect {
     /// Hard state changed — shell MUST fsync before any Send in the same
     /// batch. Vec ORDER is the contract.
     Persist,
+    PersistTruncate(LogIndex),
+    PersistEntries(Vec<LogEntry>),
     Apply(LogEntry),
-    ProposeRejected { leader_hint: Option<NodeId> },
+    ProposeRejected {
+        leader_hint: Option<NodeId>,
+    },
 }
 
 pub struct RaftNode {
@@ -90,7 +94,7 @@ impl RaftNode {
             Event::Message(from, Message::RequestVoteResp(resp)) => {
                 self.on_request_vote_resp(from, resp)
             }
-            Event::Message(_, Message::AppendEntries(_)) => Vec::new(),
+            Event::Message(from, Message::AppendEntries(req)) => self.on_append_entries(from, req),
             Event::Message(_, Message::AppendEntriesResp(_)) => Vec::new(),
             Event::Propose(_) => vec![Effect::ProposeRejected {
                 leader_hint: self.leader_hint,
@@ -236,6 +240,92 @@ impl RaftNode {
                 )
             })
             .collect()
+    }
+
+    fn on_append_entries(&mut self, from: NodeId, req: AppendEntriesReq) -> Vec<Effect> {
+        let mut effects = vec![];
+        effects.extend(self.maybe_step_down(req.term));
+
+        if req.term < self.current_term {
+            effects.push(Effect::Send(
+                from,
+                Message::AppendEntriesResp(AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: 0,
+                }),
+            ));
+            return effects;
+        }
+
+        if matches!(self.role, Role::Candidate { .. }) {
+            self.role = Role::Follower;
+        }
+        self.ticks_since_reset = 0;
+        self.leader_hint = Some(req.leader_id);
+
+        if self.log.term_at(req.prev_log_index) != Some(req.prev_log_term) {
+            effects.push(Effect::Send(
+                from,
+                Message::AppendEntriesResp(AppendEntriesResp {
+                    term: self.current_term,
+                    success: false,
+                    match_index: 0,
+                }),
+            ));
+            return effects;
+        }
+
+        let new_match = req.prev_log_index + req.entries.len() as u64;
+
+        let mut to_append = vec![];
+        for entry in req.entries {
+            match self.log.term_at(entry.index) {
+                Some(t) if t == entry.term => continue,
+                Some(_) => {
+                    self.log.truncate_from(entry.index);
+                    effects.push(Effect::PersistTruncate(entry.index));
+                    to_append.push(entry);
+                }
+                None => to_append.push(entry),
+            }
+        }
+
+        if !to_append.is_empty() {
+            effects.push(Effect::PersistEntries(to_append.clone()));
+            self.log.append_entries(to_append);
+        }
+
+        // Commit news rides every AppendEntries (incl. heartbeats), capped at
+        // what we actually hold.
+        if req.leader_commit > self.commit_index {
+            self.commit_index = req.leader_commit.min(self.log.last_index());
+            effects.extend(self.advance_applied());
+        }
+
+        effects.push(Effect::Send(
+            from,
+            Message::AppendEntriesResp(AppendEntriesResp {
+                term: self.current_term,
+                success: true,
+                match_index: new_match,
+            }),
+        ));
+
+        effects
+    }
+
+    /// Emit Apply for everything committed-but-not-yet-applied, in order.
+    /// Shared with the leader's commit path (step 5).
+    fn advance_applied(&mut self) -> Vec<Effect> {
+        let mut effects = vec![];
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            if let Some(entry) = self.log.get(self.last_applied) {
+                effects.push(Effect::Apply(entry.clone()));
+            }
+        }
+        effects
     }
 }
 
@@ -413,7 +503,10 @@ mod tests {
             .iter()
             .position(|e| matches!(e, Effect::Send(..)))
             .unwrap();
-        assert!(persist_pos < send_pos, "vote must hit disk before the reply");
+        assert!(
+            persist_pos < send_pos,
+            "vote must hit disk before the reply"
+        );
 
         // Second candidate, same term → deny (already voted for 1).
         let effects = n.step(vote_req(1, 3, 0, 0));
@@ -485,5 +578,180 @@ mod tests {
         let mut n = node(2, vec![1, 3], 100);
         let effects = n.step(Event::Propose(b"x".to_vec()));
         assert_eq!(effects, vec![Effect::ProposeRejected { leader_hint: None }]);
+    }
+
+    // ---- AppendEntries follower side (step 4) ----
+
+    fn entry(index: LogIndex, term: Term) -> LogEntry {
+        LogEntry {
+            term,
+            index,
+            command: format!("cmd-{index}").into_bytes(),
+        }
+    }
+
+    fn ae(
+        term: Term,
+        leader: NodeId,
+        prev: (LogIndex, Term),
+        entries: Vec<LogEntry>,
+        leader_commit: LogIndex,
+    ) -> Event {
+        Event::Message(
+            leader,
+            Message::AppendEntries(AppendEntriesReq {
+                term,
+                leader_id: leader,
+                prev_log_index: prev.0,
+                prev_log_term: prev.1,
+                entries,
+                leader_commit,
+            }),
+        )
+    }
+
+    /// Pull the AppendEntriesResp out of the effects.
+    fn ae_resp(effects: &[Effect]) -> AppendEntriesResp {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Send(_, Message::AppendEntriesResp(r)) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("no AppendEntriesResp in effects")
+    }
+
+    #[test]
+    fn append_entries_rejects_stale_leader() {
+        let mut n = node(2, vec![1, 3], 100);
+        n.current_term = 5;
+        let effects = n.step(ae(3, 1, (0, 0), vec![], 0));
+        let resp = ae_resp(&effects);
+        assert!(!resp.success);
+        assert_eq!(resp.term, 5, "teach the stale leader our term");
+        // A stale leader must NOT reset our timer or claim leader_hint.
+        assert_eq!(n.leader_hint, None);
+    }
+
+    #[test]
+    fn heartbeat_resets_election_timer_and_suppresses_election() {
+        let mut n = node(2, vec![1, 3], 10);
+        tick_n(&mut n, 9); // one tick from candidacy
+        n.step(ae(1, 1, (0, 0), vec![], 0)); // live leader's heartbeat
+        let effects = n.step(Event::Tick); // would have been tick #10
+        assert!(effects.is_empty(), "heartbeat must defer the election");
+        assert_eq!(n.leader_hint, Some(1));
+        assert_eq!(n.current_term, 1, "adopted the leader's term");
+    }
+
+    #[test]
+    fn append_entries_rejects_on_consistency_gap() {
+        let mut n = node(2, vec![1, 3], 100);
+        // Leader thinks we have (1, t1); our log is empty → reject.
+        let effects = n.step(ae(1, 1, (1, 1), vec![entry(2, 1)], 0));
+        assert!(!ae_resp(&effects).success);
+        assert_eq!(n.log.last_index(), 0, "nothing appended past a gap");
+        // But the timer/leader_hint DID reset — a live leader exists and is
+        // about to back off next_index to repair us.
+        assert_eq!(n.leader_hint, Some(1));
+    }
+
+    #[test]
+    fn appends_new_entries_acks_match_and_persists_before_reply() {
+        let mut n = node(2, vec![1, 3], 100);
+        let effects = n.step(ae(1, 1, (0, 0), vec![entry(1, 1), entry(2, 1)], 0));
+
+        let resp = ae_resp(&effects);
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 2);
+        assert_eq!(n.log.last_index(), 2);
+
+        // PersistEntries must precede the reply Send: "I have it" must be
+        // durable before we say it.
+        let persist_pos = effects
+            .iter()
+            .position(|e| matches!(e, Effect::PersistEntries(_)))
+            .expect("entries persisted");
+        let send_pos = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Send(_, Message::AppendEntriesResp(_))))
+            .unwrap();
+        assert!(persist_pos < send_pos);
+    }
+
+    #[test]
+    fn duplicate_delivery_is_idempotent() {
+        let mut n = node(2, vec![1, 3], 100);
+        let msg = ae(1, 1, (0, 0), vec![entry(1, 1), entry(2, 1)], 0);
+        n.step(msg.clone());
+        let effects = n.step(msg); // exact retransmit
+
+        // Same ack, but NO new persistence and NO log change.
+        let resp = ae_resp(&effects);
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 2);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistEntries(_) | Effect::PersistTruncate(_))),
+            "retransmit must not re-persist or truncate"
+        );
+        assert_eq!(n.log.last_index(), 2);
+    }
+
+    /// The worked example from the walkthrough: follower diverged at 3-4 with
+    /// term-2 entries; term-3 leader replaces them.
+    #[test]
+    fn conflicting_suffix_is_truncated_and_replaced() {
+        let mut n = node(2, vec![1, 3], 100);
+        n.current_term = 3;
+        n.step(ae(3, 1, (0, 0), vec![entry(1, 1), entry(2, 1)], 0));
+        // Inject the divergent suffix directly (as if from a deposed leader).
+        n.log.append_entries(vec![entry(3, 2), entry(4, 2)]);
+
+        let effects = n.step(ae(3, 1, (2, 1), vec![entry(3, 3), entry(4, 3)], 0));
+
+        assert!(ae_resp(&effects).success);
+        assert!(effects.contains(&Effect::PersistTruncate(3)));
+        // Final log: [t1, t1, t3, t3] — the leader's version won.
+        let terms: Vec<Term> = (1..=4).map(|i| n.log.term_at(i).unwrap()).collect();
+        assert_eq!(terms, vec![1, 1, 3, 3]);
+        assert_eq!(n.log.last_index(), 4);
+    }
+
+    #[test]
+    fn commit_advances_applies_in_order_and_caps_at_log_end() {
+        let mut n = node(2, vec![1, 3], 100);
+        n.step(ae(1, 1, (0, 0), vec![entry(1, 1), entry(2, 1)], 0));
+
+        // Leader says commit=5 but we only hold 2 → cap at 2, apply 1 then 2.
+        let effects = n.step(ae(1, 1, (2, 1), vec![], 5));
+        let applied: Vec<LogIndex> = effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Apply(entry) => Some(entry.index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(applied, vec![1, 2], "apply IN ORDER, capped at our log end");
+        assert_eq!(n.commit_index, 2);
+        assert_eq!(n.last_applied, 2);
+
+        // Same commit news again → nothing new to apply.
+        let effects = n.step(ae(1, 1, (2, 1), vec![], 5));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Apply(_))));
+    }
+
+    #[test]
+    fn candidate_yields_to_leader_of_same_term() {
+        let mut n = node(2, vec![1, 3], 1);
+        n.step(Event::Tick); // candidate, term 1
+        assert!(matches!(n.role, Role::Candidate { .. }));
+
+        // A leader of OUR term announces itself → we lost the race; yield.
+        n.step(ae(1, 1, (0, 0), vec![], 0));
+        assert!(matches!(n.role, Role::Follower));
+        assert_eq!(n.leader_hint, Some(1));
+        assert_eq!(n.current_term, 1, "same term — no bump");
     }
 }
