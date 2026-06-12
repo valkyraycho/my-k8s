@@ -92,6 +92,19 @@
   - [[#5. mykubectl: services + endpoints|5 · mykubectl svc/endpoints]]
   - [[#6. e2e validation (on the VM)|6 · e2e validation]]
   - [[#Phase 5b wrap — what this earned us|Phase 5b wrap]]
+- [[#Phase 6a — Raft, from scratch]]
+  - [[#0. The mental model: what problem Raft actually solves|0 · The mental model]]
+  - [[#1. The log and the two IDs that rule everything (`raft/log.rs`)|1 · Log, terms, indices]]
+  - [[#2. The two RPCs (`raft/message.rs`)|2 · The two RPCs]]
+  - [[#3. Persistence: the three things that must survive (`raft/storage.rs`)|3 · Persistence (HardState + log)]]
+  - [[#4. The pure core: events in, effects out (`raft/core.rs`)|4 · The pure core (step)]]
+  - [[#5. Elections, traced (`raft/core.rs`)|5 · Elections, traced]]
+  - [[#6. Log replication and repair, traced (`raft/core.rs`)|6 · Replication + repair, traced]]
+  - [[#7. The commit rule and Figure 8 — the hardest idea in Raft|7 · Commit rule / Figure 8]]
+  - [[#8. The async shell (`raft/node.rs`) and transport|8 · The shell + transport]]
+  - [[#9. The simulation harness (`raft/sim_tests.rs`)|9 · Simulation harness]]
+  - [[#10. e2e: three processes, one kill -9 (`bin/raft-demo.rs`)|10 · e2e raft-demo]]
+  - [[#Phase 6a wrap — what this earned us|Phase 6a wrap]]
 
 ---
 
@@ -115,7 +128,8 @@
 | 4 | Scheduler | Pods distributed across 2+ kubelets ✅ |
 | 5a | Real pod networking | cross-node `wget <pod-ip>:8080` works; IPs survive restart ✅ |
 | 5b | Services & networking | `curl` a Service VIP, traffic load-balances ✅ |
-| 6 | Distributed-systems track | Pick from: leader election, Raft, admission webhooks, CNI, RBAC ⬅ **next** |
+| 6a | Raft consensus, from scratch | 3-node cluster elects, replicates, survives leader `kill -9` with zero loss ✅ |
+| 6b | Raft under the apiserver | 3 apiserver replicas agree on one store ⬅ **next** |
 
 Phase 6 explicitly **dropped** "write your own runtime" — already done that in the prior Docker project. Replaced with distributed-systems content where the marginal learning is highest.
 
@@ -167,7 +181,7 @@ Phase 6 explicitly **dropped** "write your own runtime" — already done that in
 
 **Layer 3 — mock-runtime tests.** The kubelet's reconciler is generic over `RuntimeClient`; tests substitute a `MockRuntime` that records calls and serves canned states. This exercises sandbox-lifecycle ordering, CrashLoopBackOff, partial-create rollback, status dedup, and restart recovery — all the orchestration logic — **with no libcontainer, no root, no Linux**. This is the entire payoff of the trait seam (P1 §3): the hard-to-run dependency is mocked, the logic is tested everywhere.
 
-**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **178 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
+**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **229 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
 
 ## Running the automated layers (1–3)
 
@@ -219,7 +233,13 @@ Each entry: the scenario, the key command(s), and the **property** it demonstrat
 - scale RS 3→5 → Endpoints + iptables update live → 20/20 curls spread across 5. *Proved: the service→endpoints→iptables pipeline is reactive, not one-shot.*
 - Bugs/env caught only here: `iptables` not installed on the VM (`apt-get install iptables`); the ClusterIP double-guard (re-apply was burning VIPs with only the request-side check); an E0428 `run` vs `run_cmd` name clash; and the reassuring negative result that a correctly-scoped kube-proxy does NOT break SSH (DNAT only matches `10.96.x` VIPs, MASQ only mark `0x4000`). *Lesson: a new privileged dataplane component needs its blast radius reasoned about explicitly — "does my rule match traffic it shouldn't?" is a design question, not a runtime surprise.*
 
-> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 178 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
+**Phase 6a — Raft (consensus).** Three `raft-demo` processes over HTTP transport, each with its own sled at `/tmp/raft-demo-N`. Note this phase added a **new validation layer between 1 and 4**: the deterministic simulation harness (real cores + real storages, fake network/time; the paper's three safety invariants checked after every step; partitions/crashes/restarts as test operations) — it caught a real *liveness* bug (fixed-timeout candidate starvation) that no single-node unit test could express, while all safety invariants held.
+- 3 processes start → node 3 elected (term 1) → leader proposes every 2s → all three print `APPLIED from-3-#1…#10` in lockstep. *Proved: real election + replication over real HTTP, state machines in lockstep.*
+- `kill -9` the leader → node 2 wins term 2 → **the proposal stream continues automatically** (#11…#16) because the proposer is gated on the `leader_watch` channel. *Proved: failover with zero committed-entry loss, and leadership-aware clients following the handoff.*
+- restart node 3 → logs `recovered id=3 term=1 last=10` (from sled) → catches up to #25 → all three APPLIED sequences **byte-identical** (`from-3-#1..10, from-2-#1..15` — the handoff visible in the log itself). *Proved: fsync'd persistence + restart recovery + log repair converge a rejoining node.*
+- Caught during the build (sim + tests, not e2e): the starving-candidate liveness phenomenon (fix: re-randomize timeout per candidacy); a follower commit path that never emitted Apply effects (dead code caught by decision-table test design); zero-padded log keys (the >10-entries ordering bug). *Lesson: for distributed algorithms the simulator IS the primary test; e2e only confirms the shell's plumbing.*
+
+> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 229 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
 
 ---
 
@@ -1854,3 +1874,320 @@ The transferable haul, now framed as *re-derivable moves* ([[#Engineering princi
 What we did NOT build: Service types beyond ClusterIP (no NodePort/LoadBalancer), kube-proxy IPVS mode (iptables only), readiness gating of endpoints beyond phase+IP, and DNS (you hit the VIP directly, not a name).
 
 **Phase 6 (next) is the distributed-systems track** — leader election, Raft-backed storage, admission webhooks, a real CNI plugin, or RBAC. The single-instance assumption baked into the controller-manager, scheduler, and kube-proxy (each must run exactly once) is the thread Phase 6's leader-election option would pull.
+
+---
+
+# Phase 6a — Raft, from scratch
+
+The deepest dive of the project: a complete Raft consensus implementation per the paper's Figure 2 — leader election, log replication, the safety rules, persistence, an async shell, an HTTP transport, and a deterministic simulation harness that checks the paper's invariants after *every step*. **229 tests.** This section is deliberately the heaviest in the note, because Raft is famous for being graspable in outline and bewildering in its edge cases. Every "but WHY?" that came up during the build gets a worked example here.
+
+## 0. The mental model: what problem Raft actually solves
+
+Strip everything away and Raft answers one question: **how do N machines agree on the contents of a list, when any of them can crash and the network can drop or reorder messages?** That list is the *replicated log*. If every machine ends up with the same log and applies it in order to its own copy of some state machine (a KV store, our sled store), every machine computes the same state. Same log → same state. That's the entire game: **agree on the log, and state agreement falls out for free.**
+
+```
+   client ──propose──►  ┌─ leader ─┐      replicate      ┌─ follower ─┐
+                        │ log: a b c │ ──────────────────► │ log: a b c │
+                        │ KV  ↑apply │                     │ KV  ↑apply │
+                        └───────────┘                      └────────────┘
+        every node applies the SAME log in the SAME order → identical KV state
+```
+
+The two sub-problems Raft splits this into:
+1. **Election** — exactly one node (the leader) may extend the log at a time. (Two writers = divergent logs = the thing we're trying to prevent.)
+2. **Replication** — the leader gets its entries onto a *majority* of nodes before declaring them permanent ("committed").
+
+Why a **majority**? Because any two majorities of the same cluster *overlap in at least one node*. That single overlapping node is the thread of continuity: a new leader elected by majority B must share a member with the old majority A that accepted entries — so the new leader's election can be forced (via the vote rules, §5) to go through someone who *has* the committed data. Every safety argument in Raft bottoms out at "two majorities intersect."
+
+> **🧭 Design rationale — why this is the problem our apiserver has.** Our apiserver (P2) is one process over one sled DB — a single point of failure. Run three apiservers naively and they'd each have their own sled, instantly diverging. To run three replicas that *act like one store*, every write must become a log entry that all three agree on, applied in the same order to each sled. That's exactly the replicated log. 6a builds the agreement machine; 6b will put the apiserver's writes inside it. Reproducible takeaway: *replication without agreement = divergence; the canonical fix is to serialize all writes through one agreed-upon log — and consensus is the machinery that keeps that log identical everywhere despite crashes.*
+
+## 1. The log and the two IDs that rule everything (`raft/log.rs`)
+
+```rust
+pub type Term = u64;       // logical clock: bumps on every election attempt
+pub type LogIndex = u64;   // 1-BASED position in the log; 0 = "empty log"
+pub struct LogEntry { pub term: Term, pub index: LogIndex, pub command: Vec<u8> }
+```
+
+**Concept — the term is a logical clock, and it's the key to EVERYTHING.** A term is "the reign of (at most) one leader." Every election attempt bumps it. Every message carries the sender's term, and every node enforces one universal rule: *see a higher term → adopt it and become a follower; see a lower term → the sender is stale, refuse/correct it.* This one rule is what makes crashed-and-returned old leaders harmless — the moment a deposed leader (term 3) hears from anyone in term 5, it steps down. Terms turn "who is in charge?" — a question about *time*, which distributed nodes can't agree on — into a question about *numbers*, which they can compare.
+
+```
+   term:     1111 222 4444444          ← each node tracks current_term
+              ↑    ↑   ↑
+            leader leader leader      (term 3 existed but elected nobody —
+             A      B     C            a failed election still burns a term)
+```
+
+**Concept — an entry's identity is the `(index, term)` PAIR, not the index.** Two nodes can both have "entry 5" with *different contents* — if they got them from different leaders (different terms). The pair `(5, t2)` vs `(5, t3)` distinguishes them. Raft's **Log Matching property** says: if two logs have the same `(index, term)`, then they hold the *same command* — and so do all earlier entries. The whole repair machinery (§6) exists to enforce this.
+
+> **🔧 Implementation choice — 1-based indices with a `(0,0)` sentinel.** The paper is 1-based; translating to 0-based Rust would invite ±1 bugs in every Figure 2 formula, so `RaftLog` stays 1-based (entry *i* lives at `entries[i-1]`). The payoff is `term_at(0) == Some(0)`: the "entry before the first entry" is the sentinel `(index 0, term 0)`, which makes the very first AppendEntries consistency check (`prev=(0,0)`) *vacuously true on every node* — no special "empty log" branch anywhere. Cue: *when implementing from a paper, keep the paper's indexing and add a sentinel for the boundary, rather than shifting the math and hoping you got every formula right.*
+
+## 2. The two RPCs (`raft/message.rs`)
+
+Raft needs exactly two message types (plus their replies):
+
+| RPC | Sent by | Asks | Carries |
+|---|---|---|---|
+| `RequestVote` | candidate | "elect me for term T?" | candidate's term + its log's `(last_index, last_term)` |
+| `AppendEntries` | leader | "append these after `(prev_index, prev_term)`" | new entries (empty = **heartbeat**) + `leader_commit` |
+
+```rust
+pub struct AppendEntriesResp {
+    pub term: Term,
+    pub success: bool,
+    pub match_index: LogIndex,   // "I now match you through HERE"
+}
+```
+
+> **🔧 Implementation choice — the ack says *what I have*, not *yes to that request*.** Our `AppendEntriesResp` carries `match_index` ("I match through index 8") instead of the paper's bare `success` bool. Why: messages can be reordered or duplicated. A bare "yes" is only meaningful if you know *which request* it answers — which means correlating requests to replies. A self-describing "I hold through 8" needs no correlation: the leader just takes `max(current, reply)` and stale/duplicate acks are harmless by construction. Cue: *in async protocols, prefer absolute-state acks ("my offset is X") over relative acks ("OK") — they're idempotent and reorder-proof, which deletes a whole class of correlation bookkeeping.* (Same trick TCP uses: ACK numbers are cumulative positions, not per-segment yes/nos.)
+>
+> **🦀 Rust pattern — one `Message` enum as the wire envelope.** All four message types wrap into `enum Message { RequestVote(..), RequestVoteResp(..), AppendEntries(..), AppendEntriesResp(..) }`, deriving serde. One channel/endpoint carries everything; the receiver `match`es once and the compiler guarantees no variant is forgotten. Replies are *standalone messages* sent later — never a blocking request/response — which is what lets the core stay synchronous and the transport fire-and-forget. Cue: *for a protocol over one pipe, model the message set as a single serde enum (externally tagged JSON gives you the discriminator for free), and make replies first-class messages instead of return values.*
+
+## 3. Persistence: the three things that must survive (`raft/storage.rs`)
+
+Figure 2 marks exactly three things "persistent": **`current_term`**, **`voted_for`**, and **the log**. Everything else (commit_index, who's leader, next/match) is safely recomputed after a restart.
+
+**Worked example — why `voted_for` on disk is non-negotiable.** Suppose node 2 votes for candidate A in term 5, then crashes and restarts *without* remembering the vote. Candidate B asks for term 5; node 2, amnesiac, votes again. Now term 5 has **two votes from node 2** → A and B can *both* assemble "majorities" sharing node 2 → **two leaders in one term** → divergent logs. The entire single-leader guarantee rests on "one node, one vote per term," and that promise must outlive a crash:
+
+```rust
+pub fn save_hard_state(&self, hs: &HardState) -> Result<()> {
+    self.tree.insert(HARD_STATE_KEY, serde_json::to_vec(hs)?)?;
+    self.tree.flush()?;   // ← fsync. A buffered vote is a forgettable vote.
+    Ok(())
+}
+```
+
+> **🔧 Implementation choice — `flush()` (= fsync) on every hard-state and log write.** sled buffers; a crash between `insert` and flush loses the write. For most apps that's a perf knob — here it's a *correctness cliff* (the double-vote above). So every persistence call flushes before returning, and the core's effect order (§4) ensures we never *send* a message claiming state that isn't yet durable. Cue: *find the writes whose loss breaks an externally-made promise (a vote sent, an ack sent) and fsync exactly those — durability is required precisely where someone else will act on your word.*
+>
+> **🦀 Rust pattern — zero-padded keys make byte order = numeric order.** Log entries live at keys `log/{index:020}` (20-digit zero-padded). sled iterates keys in *byte* order: unpadded, `"log/10"` sorts before `"log/2"` and `load_log` would return entries misordered — silently corrupting the log on restart. `{:020}` makes lexicographic = numeric. (Same idiom as the apiserver's rv index.) The test that catches it uses 25 entries — you *must* cross 10 to expose the bug. Cue: *any time numbers become string keys in an ordered store, zero-pad to fixed width — and test past a digit boundary.*
+
+`truncate_from` has its own trap: when a follower overwrites a conflicting suffix, the *disk* must also drop everything from the conflict point — entries past the rewrite that survive on disk are **zombies** that would resurrect on restart (the `truncate_from_kills_the_zombie_suffix` test pins the scenario: entries 3,4 on disk; truncate-at-3 then write a single new 3; without the truncate, old entry 4 reappears after reboot next to new entry 3).
+
+## 4. The pure core: events in, effects out (`raft/core.rs`)
+
+The architectural centerpiece. The entire Raft brain is one synchronous, side-effect-free function:
+
+```rust
+pub fn step(&mut self, event: Event) -> Vec<Effect>
+
+pub enum Event {                      pub enum Effect {
+    Tick,                                 Send(NodeId, Message),
+    Message(NodeId, Message),             Persist,                  // hard state → disk
+    Propose(Vec<u8>),                     PersistTruncate(LogIndex),
+}                                         PersistEntries(Vec<LogEntry>),
+                                          Apply(LogEntry),          // hand to state machine
+                                          ProposeRejected { leader_hint: Option<NodeId> },
+                                      }
+```
+
+No I/O, no clocks, no randomness inside. Time arrives as `Event::Tick` (the shell ticks every 50ms; the core just counts them). The network arrives as `Event::Message`. Everything the node *wants done* leaves as `Effect`s, which the shell executes **in order** — and that order IS the safety contract:
+
+```
+   step() returns:  [ Persist,  Send(2, RequestVote), Send(3, RequestVote) ]
+                       ↑ MUST hit disk before ───────► these leave the machine
+```
+
+**Worked example — persist-before-send.** When a node becomes a candidate it sets `voted_for = me` and emits `[Persist, Send, Send]`. If the shell sent first and crashed before persisting, the node could wake up, forget it voted for itself, and grant its term-5 vote to someone else — the double-vote disaster from §3 again, self-inflicted. The core can't *enforce* the ordering (it's pure); it *encodes* it in the Vec, and the shell's one job is to honor it. The tests assert positions: `persist_pos < send_pos`.
+
+> **🧭 Design rationale — how you'd arrive at the pure core (sans-I/O) architecture.** Start from the question "how do I *test* consensus?" The bugs that matter live in vanishingly rare interleavings: a vote arriving during a candidacy, a crash between persist and send, a partition healing mid-election. Real networks and timers produce those interleavings *occasionally and unreproducibly* — a test that fails once a week is worse than none. The only way to make the interleavings *choosable* is to evict everything nondeterministic (time, network, disk, randomness) from the logic. What's left is a function of `(state, event) → (state', effects)` — and now a test can hand-feed ANY sequence of events and assert on exact effects, and a simulator (§9) can interleave thousands of orderings deterministically. The async shell becomes a dumb executor with almost nothing to get wrong. Reproducible takeaway: *when correctness depends on event orderings you can't control, restructure so the logic is a pure event→effects function and the orderings become test INPUT. (This is "functional core, imperative shell" — P5b's kube-proxy planner — escalated from testing-convenience to the only viable strategy.)*
+>
+> **🦀 Rust pattern — leader bookkeeping lives INSIDE the `Role::Leader` variant.**
+> ```rust
+> pub enum Role {
+>     Follower,
+>     Candidate { votes: HashSet<NodeId> },
+>     Leader { next_index: HashMap<NodeId, LogIndex>, match_index: HashMap<NodeId, LogIndex> },
+> }
+> ```
+> `next_index`/`match_index` only mean anything while leading; `votes` only while campaigning. Putting them *in the variant* (rather than as `Option` fields on the struct) makes illegal states unrepresentable: you literally cannot read leader bookkeeping as a follower (the pattern match won't let you), and stepping down (`role = Follower`) *destroys* it — no "stale match_index from last reign" bug class, no manual cleanup to forget. The compiler enforces what would otherwise be a comment in Go (`// only valid when state == Leader`). Cue: *when fields are only valid in one mode, move them into that mode's enum variant — state transitions then automatically create/destroy exactly the right data.*
+
+## 5. Elections, traced (`raft/core.rs`)
+
+The follower's clock: every `Tick` bumps `ticks_since_reset`; hitting `election_timeout_ticks` (randomized 10–20) with no word from a leader → become candidate. Trace a 3-node election:
+
+```
+  node 1 (timeout 12)          node 2 (timeout 15)          node 3 (timeout 18)
+  ─────────────────            ─────────────────            ─────────────────
+  tick 12: TIMEOUT
+    term 0→1, vote self
+    [Persist, Send RV→2, Send RV→3]
+                               receives RequestVote(t1):
+                                 t1 > t0 → adopt term 1
+                                 log_ok? yes; can_vote? yes
+                                 → grant, reset timer
+                                 [Persist, Send grant→1]
+  receives grant from 2:
+    votes {1,2} ≥ majority(2)
+    → LEADER. next=[last+1,last+1]
+    [Send heartbeat→2, Send heartbeat→3] ◄── announces + suppresses 3's timeout
+                                              (3 never reaches tick 18)
+```
+
+The vote rule, straight from the code (`on_request_vote`):
+```rust
+let log_ok = (req.last_log_term, req.last_log_index)      // §5.4.1: lexicographic
+    >= (self.log.last_term(), self.log.last_index());     //   tuple comparison
+let can_vote = self.voted_for.is_none() || self.voted_for == Some(req.candidate_id);
+let grant = req.term == self.current_term && log_ok && can_vote;
+```
+
+**Concept — the §5.4.1 "up-to-date" check is what protects committed data.** A candidate must show its log's `(last_term, last_index)`; voters refuse anyone *behind* them. Why this matters: a committed entry lives on a majority. A candidate missing it cannot win, because it would need votes from a majority — and every majority contains at least one holder of that entry, who will vote "your log is behind mine, no." The election itself filters out leaders who'd lose data. Higher last-*term* wins outright (a longer log from a dead term is still older news); same term → longer log wins.
+
+> **🦀 Rust pattern — tuple comparison IS the lexicographic rule.** `(a_term, a_idx) >= (b_term, b_idx)` compares term first, index only on ties — exactly §5.4.1, in one expression, with no nested if/else to get backwards. Cue: *for "compare by A, then by B" rules, build tuples and use the built-in `Ord` — it's both shorter and harder to get wrong than hand-rolled precedence logic.*
+>
+> **🔧 Implementation choice — granting a vote resets YOUR election timer.** Subtle but load-bearing: when node 2 grants its vote, it also resets its own timeout (`ticks_since_reset = 0`). Otherwise this happens: 2 grants to 1, then 2's own timeout fires a few ticks later, 2 starts a *competing* election in term 2, and dethrones the leader it just elected. A grant means "I believe a leader is being born — I'll hold off." Same for hearing any live leader's AppendEntries. The things that reset the timer are precisely the things that mean *the cluster is functioning without me stepping up*.
+
+**Split votes and the randomized timeout.** Two nodes timing out simultaneously → each votes for itself → neither gets a majority → term burned, try again. The fix is jittered timeouts (10–20 ticks, re-randomized by the shell on *every* new candidacy) so a retry rarely collides twice. And **the sim harness caught the real failure mode here** (§9): with *fixed* timeouts, a lagging candidate (log behind, can never win) can time out perpetually *first*, and each hopeless candidacy bumps the term — which makes everyone else `maybe_step_down` and reset, starving the node that *could* win. Liveness, not safety: no invariant fires, the cluster just never elects anyone. Re-randomizing per candidacy breaks the lockstep. (Production systems add PreVote; we documented rather than built it.)
+
+## 6. Log replication and repair, traced (`raft/core.rs`)
+
+The leader keeps two numbers per peer — and one mechanism serves heartbeat, replication, *and* retransmission:
+
+```
+   next_index[p]  = the next entry I'll SEND p        (optimistic, walks back on reject)
+   match_index[p] = the highest entry p CONFIRMED      (pessimistic, only moves up)
+
+   append_for(p): send entries[next_index[p]..] with prev = (next-1, term_at(next-1))
+                  └── caught-up peer → empty entries = pure heartbeat
+```
+
+**The consistency check.** Every AppendEntries says: "these entries go after `(prev_index, prev_term)`." The follower checks it *holds* that exact pair (`term_at(prev_index) == prev_term`); if not, it rejects, and the leader walks `next_index` back one and re-probes. Induction: if the follower matched at `prev`, and every earlier append also matched, the logs are identical up to `prev` — appending preserves Log Matching.
+
+**Worked example — repairing a diverged follower.** Leader (term 3) has `[t1, t1, t3, t3]`; follower diverged with `[t1, t1, t2, t2]` (entries 3–4 from a deposed term-2 leader that never committed them):
+
+```
+ leader sends: prev=(4,t3), entries=[]            follower: term_at(4)=t2 ≠ t3 → REJECT
+ leader: next[f] 5→4; sends prev=(3,t3), [e4]     follower: term_at(3)=t2 ≠ t3 → REJECT
+ leader: next[f] 4→3; sends prev=(2,t1), [e3,e4]  follower: term_at(2)=t1 ✓ MATCH
+                                                   → entry 3: have t2, incoming t3 → CONFLICT
+                                                     truncate_from(3)  [+PersistTruncate]
+                                                     append [e3,e4]    [+PersistEntries]
+                                                   → log now [t1, t1, t3, t3]  ✓ repaired
+```
+
+The follower's three-way scan per incoming entry (from `on_append_entries`):
+```rust
+match self.log.term_at(entry.index) {
+    Some(t) if t == entry.term => continue,        // already have it → skip (idempotent!)
+    Some(_) => {                                    // CONFLICT → truncate from here, then take
+        self.log.truncate_from(entry.index);
+        effects.push(Effect::PersistTruncate(entry.index));
+        to_append.push(entry);
+    }
+    None => to_append.push(entry),                  // new territory → take
+}
+```
+The `continue` arm is why a duplicated/retransmitted AppendEntries is **harmless**: re-delivery finds every entry already present, appends nothing, re-persists nothing, and just re-acks (pinned by `duplicate_delivery_is_idempotent`).
+
+> **🧭 Design rationale — why the leader never asks "what do you have?"** You might expect a negotiation: leader asks, follower answers, leader sends the diff. Raft instead has the leader *assert optimistically* (`next = my last+1`) and walk back on rejection — converging on the divergence point by probing. Why this shape? It makes every message **self-contained and stateless**: an AppendEntries means the same thing no matter what was lost before it, so retransmission is trivially safe and there's no conversation state to corrupt. The cost is O(divergence) round trips — fine, because big divergences are rare. Reproducible takeaway: *in unreliable networks, prefer stateless probe-and-converge over stateful negotiation — every message idempotent and self-describing beats fewer-but-fragile round trips.*
+
+## 7. The commit rule and Figure 8 — the hardest idea in Raft
+
+**Committed** = "this entry can never be lost, no matter who crashes" = it's on a majority *and* the leader has declared it so. The leader advances `commit_index` to the highest `n` where a majority's `match_index ≥ n` — **but only counts entries from its OWN term**:
+
+```rust
+for n in (self.commit_index + 1..=self.log.last_index()).rev() {
+    if self.log.term_at(n) != Some(self.current_term) {
+        continue;            // ← the Figure 8 guard: NEVER count old-term entries
+    }
+    let holders = 1 + peers.filter(|p| match_index[p] >= n).count();
+    if holders >= self.majority() { found = n; break; }
+}
+```
+
+**Why?! The Figure 8 scenario, slowly.** The paper's most subtle trap. Suppose a new leader (term 4) finds an *old* entry (term 2, index 1) already sitting on a majority. "Majority = committed", right? **No.** Here's the disaster if it commits it:
+
+```
+   Setup: node 1's log has [idx1:t2]. Node 1 wins term 4. Peers 2,3 ack idx1.
+          A rival (node 5) holds [idx1:t3] — a term-3 entry from a failed reign.
+
+   If leader counts the t2 entry: majority holds idx1 → "commit!" → APPLIED. 💥
+   Then leader 1 crashes. Node 5 runs for term 5: its last_term=3 BEATS the
+   others' last_term=2 (§5.4.1!) → node 5 WINS, and its log says idx1 is the
+   t3 entry → it overwrites idx1 on everyone. The "committed" t2 entry is gone
+   — but we already applied it. State machines have now diverged. Game over.
+```
+
+The killer detail: node 5's *higher last term* legitimately wins elections even though the t2 entry sat on a majority — "on a majority" does NOT imply "safe" for old-term entries, because newer-term logs beat longer ones in voting. **Only own-term entries are safe to commit by counting** — when the term-4 leader replicates a term-4 entry to a majority, any future winner must (by §5.4.1) have last_term ≥ 4, and the only term-4 entries in existence came from this leader's log — so the winner provably contains everything up to that entry. And that's also how old entries DO commit: **transitively**. Commit a term-4 entry at index 2, and index 1 beneath it is implicitly committed too (the `figure8_old_term_entry_commits_only_transitively` test walks exactly this: acks on the old entry alone do nothing; one own-term entry on a majority commits both, applying `[1, 2]` in order).
+
+> **🧭 Design rationale — the meta-lesson of Figure 8.** The seductive-but-wrong rule ("majority holds it → committed") fails because of an interaction between two *separately correct* rules: the vote rule prefers higher last-*term*, and replication can spread old entries widely. Neither rule is wrong; their composition has a hole. The fix isn't more machinery — it's *narrowing a claim* ("I only declare MY OWN entries committed") until composition is provably safe. Reproducible takeaway: *in distributed protocols, audit the INTERACTIONS between individually-sound rules — and when a claim is unsafe in general, restrict the claimant rather than adding mechanism. Also: this is why you implement consensus from a paper and not from intuition.*
+
+## 8. The async shell (`raft/node.rs`) and transport
+
+The shell is everything the core refused to be — and it's *boring*, by design:
+
+```rust
+loop {
+    let event = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => break,
+        _ = tick.tick() => Event::Tick,                       // 50ms → Event::Tick
+        Some((from, msg)) = self.inbox.recv() => Event::Message(from, msg),
+        Some(p) = self.proposals.recv() => Event::Propose(p),
+    };
+    let effects = self.node.step(event);     // ← ALL the thinking
+    /* re-randomize timeout on Follower→Candidate edge */
+    self.execute(effects).await;             // ← in order: persist ⟶ send ⟶ apply
+    self.leader_watch.send_if_modified(/* publish leader_hint on change */);
+}
+```
+
+The channel topology around it:
+```
+   HTTP POST /raft/message ──► inbox(mpsc) ──┐
+   ticker 50ms ─────────────────────────────►│ select! → step() → effects
+   client proposals ───────► proposals(mpsc)─┘            │
+                                                          ├─ storage (sled, fsync)
+   state machine ◄─(mpsc, backpressure)── Apply ◄─────────┤
+   anyone curious ◄─(watch)── leader_hint ◄───────────────┘
+```
+
+> **🦀 Rust pattern — the right channel for each job.** Three different tokio primitives, each matched to its semantics: **`mpsc`** for the inbox/proposals (queued work, many producers, must not be lost once accepted); **`mpsc` with `.send().await`** for Apply — *backpressure*: if the state machine falls behind, the shell awaits rather than buffering unboundedly; **`watch`** for `leader_hint` — observers only care about the *latest* value, not the history, and `send_if_modified` dedups so watchers wake only on real changes (the same latest-value-only semantics as a K8s status). Cue: *pick channels by data semantics — queue of jobs = mpsc; latest-value-wins = watch; broadcast of events = broadcast — rather than defaulting to mpsc everywhere and reimplementing the others badly.*
+>
+> **🔧 Implementation choice — no `rand` crate: a 10-line xorshift in the shell.** The only randomness Raft needs is election-timeout jitter. Pulling in `rand` for that is a whole dependency tree for one `% 10`; a seeded xorshift (`x ^= x<<13; x ^= x>>7; x ^= x<<17`) is plenty — and *seedable*, which keeps even the shell deterministic when tests want it (`0xC0FFEE + id`). The core never sees randomness at all (it takes the timeout as a parameter), preserving its purity. Cue: *for non-cryptographic jitter, a seeded xorshift beats a dependency; and keep randomness OUT of the logic — generate it at the edge, pass it in as data.*
+
+The `Transport` trait is one fire-and-forget method — `fn send(&self, to: NodeId, msg: Message)` — with the contract that **losing a message is fine** (Raft's heartbeat retransmission and election retries are the recovery story; reliability machinery in the transport would be redundant). `HttpTransport` spawns a task per send and ignores the result; replies arrive later as ordinary inbox messages via the peer's own POST.
+
+## 9. The simulation harness (`raft/sim_tests.rs`)
+
+The payoff of the pure core: a **deterministic cluster simulator** — real `RaftNode`s, real `RaftStorage`s (sled), and a fake everything-else: messages go into a FIFO `VecDeque` instead of a network; partitions are a `HashSet<(from,to)>` of blocked links; crash = mark dead, **restart = rebuild the node from its sled storage** (the true recovery path). After *every single step*, the paper's three safety invariants are checked:
+
+```
+   Election Safety     at most one leader per term, ever          (leaders_by_term map)
+   Log Matching        same (index,term) on two nodes → same command
+   State-Machine Safety  every node's apply stream is a prefix of every other's
+```
+
+Seven scenarios run on this rig — election + stability, split-vote resolution, **committed entries survive leader crash**, stale leader steps down + uncommitted entries vanish, restart-recovers-from-sled + catches up, 5-node cluster survives 2 crashes but halts at 3 (majority arithmetic made visible), and duplicate-delivery harmlessness.
+
+> **⚙ Principle — check invariants continuously, not outcomes at the end.** The harness doesn't just assert the final state looks right; it validates all three safety properties after *every step of every scenario*. An invariant violated transiently-then-masked would pass an end-state assertion but is still a real bug (something observed the broken state). Continuous checking turns every scenario into hundreds of assertions and catches the violation at the exact step it appears. Cue: *when a system claims invariants, assert them at every state transition in tests — "ends correct" is far weaker than "never wrong."*
+>
+> **🧭 Design rationale — the sim caught a bug class the unit tests structurally couldn't.** Every unit test in core.rs drives ONE node and asserts its effects. The starving-candidate liveness failure (§5) only exists in the *interaction* of multiple nodes' timers — node A's hopeless candidacies resetting node B's progress, forever. No single-node test can express that; the sim found it within seconds of existing, deterministically. Reproducible takeaway: *unit tests verify components, simulators verify emergent behavior; for distributed algorithms the interesting bugs are ALL emergent, so the simulator isn't a nice-to-have — it's the primary test.* (Also note: the sim found a LIVENESS bug while all SAFETY invariants held — the two failure classes are independent, and you must watch for both.)
+
+## 10. e2e: three processes, one kill -9 (`bin/raft-demo.rs`)
+
+The demo binary assembles the real thing: one `RaftShell` per process, `HttpTransport`, axum endpoint for the inbox, a proposer that submits a numbered command every 2s **gated on `leader_watch`** (only the current leader proposes), and an APPLIED printer. On the VM:
+
+```
+  terminal 1-3:  raft-demo --id N --listen 127.0.0.1:700N --peers "..." --db /tmp/raft-demo-N
+  → node 3 elected (term 1); all three print APPLIED from-3-#1 … #10 in lockstep
+  kill -9 <node 3>
+  → node 2 times out, wins term 2; proposal stream CONTINUES (applied #11…#16)
+    — the proposer is leader-gated, so the new leader picks up proposing automatically
+  restart node 3
+  → "recovered id=3 term=1 last=10" from sled → catches up to #25
+  → all three APPLIED sequences byte-identical: from-3-#1..10, from-2-#1..15
+                                                ↑ the leadership handoff, visible in the log
+```
+
+What only this run could prove: real fsync'd recovery across a process kill, real HTTP message loss tolerance, and the leader-gated proposer following the `watch` channel across a failover. (Validation catalog has the full entry.)
+
+## Phase 6a wrap — what this earned us
+
+A from-scratch, paper-faithful Raft: elections with the §5.4.1 log check, replication with probe-and-converge repair, the Figure-8-safe commit rule, fsync'd persistence of exactly the three things that must survive, a pure event→effects core under an async shell, and a deterministic simulator enforcing the paper's invariants at every step — 229 tests, plus a 3-process e2e surviving `kill -9` with zero committed-entry loss.
+
+The transferable haul: **pure-core/imperative-shell as the only viable testing strategy for interleaving-sensitive logic**; absolute-state acks over correlated yes/nos; persist-before-promise (and fsync exactly where promises are made); logical clocks (terms) turning time disputes into number comparisons; majority-intersection as the bedrock safety argument; narrow-the-claim when sound rules compose unsafely (Figure 8); invariant-checking-every-step; and simulators for emergent behavior. Rust-wise: state-dependent data inside enum variants, tuple-`Ord` for lexicographic rules, channel selection by semantics (mpsc/watch/backpressure), and seeded xorshift over a `rand` dependency.
+
+What we did NOT build (scoped out, documented): log compaction/snapshots (the log grows forever), cluster membership changes (fixed 3 nodes), PreVote (we re-randomize timeouts instead), and read-index/lease reads (reads aren't linearizable through the log).
+
+**Phase 6b (next): put the apiserver on top of it.** Writes become `StoreCommand` log entries; three apiserver replicas apply the same log to their own sleds (deterministic rv across replicas — same-log-same-state in action); followers redirect writes to the leader (307 + the leader hint); `--standalone` keeps the single-node path. The agreement machine is built; 6b makes it carry real cargo.
