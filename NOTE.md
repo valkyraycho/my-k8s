@@ -105,6 +105,19 @@
   - [[#9. The simulation harness (`raft/sim_tests.rs`)|9 · Simulation harness]]
   - [[#10. e2e: three processes, one kill -9 (`bin/raft-demo.rs`)|10 · e2e raft-demo]]
   - [[#Phase 6a wrap — what this earned us|Phase 6a wrap]]
+- [[#Phase 6b — The replicated apiserver (Raft under the store)]]
+  - [[#0. The mental model: same log → same state REQUIRES determinism|0 · Mental model: determinism]]
+  - [[#1. The command language: every write becomes one log entry (`apiserver/command.rs`)|1 · StoreCommand language]]
+  - [[#2. The determinism discipline: pre-stamp + pure allocation|2 · Determinism discipline]]
+  - [[#3. The applier: committed commands → the five stores (`apiserver/applier.rs`)|3 · The applier]]
+  - [[#4. The glue: turning an async commit back into an HTTP response (`apiserver/raft_glue.rs`)|4 · The glue (propose→commit→reply)]]
+  - [[#5. WritePath: one codebase, standalone OR replicated (`apiserver/handlers.rs`)|5 · WritePath (Direct vs Raft)]]
+  - [[#6. Follower redirects and the read-before-write trap|6 · Redirects + read-before-write]]
+  - [[#7. Reads are local: the deliberate staleness tradeoff|7 · Reads-are-local tradeoff]]
+  - [[#8. Assembly: the apiserver binary in two modes (`bin/apiserver.rs`)|8 · Assembly (the bin)]]
+  - [[#9. e2e: three apiservers, kill the leader (validation)|9 · e2e + validation]]
+  - [[#Phase 6b wrap — what this earned us|Phase 6b wrap]]
+  - [[#Project retrospective — what the whole thing earned|Project retrospective]]
 
 ---
 
@@ -117,7 +130,7 @@
 - **Dev environment:** OrbStack on macOS hosting an Ubuntu VM (`mykube-dev`, arm64). Source lives on the Mac, builds and runs in Linux via VirtioFS. Wrapped in a devcontainer for reproducibility.
 - **Pacing:** 6 phases over ~4–6 months, only one phase planned in depth at a time. After each phase ships, the next is replanned from scratch with what we've actually learned.
 
-**The 6-phase arc** (canonical version: `~/.claude/plans/here-is-my-next-sequential-charm.md`):
+**The 6-phase arc** — ✅ **ALL SHIPPED; project complete** (canonical version: `~/.claude/plans/here-is-my-next-sequential-charm.md`):
 
 | # | Phase | Demo at end |
 |---|-------|-------------|
@@ -129,7 +142,7 @@
 | 5a | Real pod networking | cross-node `wget <pod-ip>:8080` works; IPs survive restart ✅ |
 | 5b | Services & networking | `curl` a Service VIP, traffic load-balances ✅ |
 | 6a | Raft consensus, from scratch | 3-node cluster elects, replicates, survives leader `kill -9` with zero loss ✅ |
-| 6b | Raft under the apiserver | 3 apiserver replicas agree on one store ⬅ **next** |
+| 6b | Raft under the apiserver | 3 apiserver replicas agree on one store; kill the leader, writes continue ✅ |
 
 Phase 6 explicitly **dropped** "write your own runtime" — already done that in the prior Docker project. Replaced with distributed-systems content where the marginal learning is highest.
 
@@ -181,7 +194,7 @@ Phase 6 explicitly **dropped** "write your own runtime" — already done that in
 
 **Layer 3 — mock-runtime tests.** The kubelet's reconciler is generic over `RuntimeClient`; tests substitute a `MockRuntime` that records calls and serves canned states. This exercises sandbox-lifecycle ordering, CrashLoopBackOff, partial-create rollback, status dedup, and restart recovery — all the orchestration logic — **with no libcontainer, no root, no Linux**. This is the entire payoff of the trait seam (P1 §3): the hard-to-run dependency is mocked, the logic is tested everywhere.
 
-**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **229 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
+**Layer 4 — on-VM e2e (manual).** The first three layers run on any machine in `cargo nextest run` (currently **246 passing**). But mocks and in-process servers cannot prove that the *real Linux kernel* does what we think — that `setns` actually shares a netns, that veth+bridge actually carries cross-node packets, that SIGTERM actually propagates, that `pivot_root` lands on our rootfs. So each phase ends with a **hand-run end-to-end test on the OrbStack VM** (`mykube-dev`), driving the real binaries against real `libcontainer` containers. These are the assumptions layers 1–3 take on faith.
 
 ## Running the automated layers (1–3)
 
@@ -239,7 +252,14 @@ Each entry: the scenario, the key command(s), and the **property** it demonstrat
 - restart node 3 → logs `recovered id=3 term=1 last=10` (from sled) → catches up to #25 → all three APPLIED sequences **byte-identical** (`from-3-#1..10, from-2-#1..15` — the handoff visible in the log itself). *Proved: fsync'd persistence + restart recovery + log repair converge a rejoining node.*
 - Caught during the build (sim + tests, not e2e): the starving-candidate liveness phenomenon (fix: re-randomize timeout per candidacy); a follower commit path that never emitted Apply effects (dead code caught by decision-table test design); zero-padded log keys (the >10-entries ordering bug). *Lesson: for distributed algorithms the simulator IS the primary test; e2e only confirms the shell's plumbing.*
 
-> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 229 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
+**Phase 6b — the replicated apiserver.** Three `apiserver --raft-id N --peers ...` processes, one sled each, run as a single self-contained SSH script (launch + test + teardown in one session — see ops gotcha below). The *determinism* of apply is verified at Layer 1 (the two-appliers-converge unit test); this e2e proves the distributed plumbing.
+- write sent to a **follower** → 307 redirect → client (reqwest, default redirect-following) re-sends to the leader → 201; all three replicas' stores converge byte-identical (same objects, same resourceVersions). *Proved: same-log-same-state across real processes; transparent leader forwarding with zero client failover code.*
+- **kill the leader** mid-operation → a survivor wins a new election → writes to a survivor still commit. *Proved: the cluster tolerates one failure of three (majority of 2 survives).*
+- a committed write is durable on the survivors; a not-yet-caught-up follower briefly served a **stale local read** — observed and explained, not a bug. *Proved (by counterexample): the §7 reads-are-local tradeoff is real and visible.*
+- Bugs caught by the multi-node tests (not single-node): the read-before-write handlers (bind/create-node/create-service) needed `ensure_leader()` *before* their read, or a follower allocated from a stale store; and the determinism leaks (uid/timestamp/counter) that the two-appliers test pins. *Lesson: replication bugs are invisible to single-replica tests — you need ≥2 replicas fed the same stream, or the real multi-process cluster, to surface divergence.*
+- Ops gotcha: OrbStack SSH teardown kills `setsid`/`nohup`/`systemd-run` daemons when the session closes → the multi-process e2e must launch+test+teardown inside ONE `ssh 'bash -s'` session.
+
+> **⚙ Principle — the test pyramid: many fast tests, few slow ones, and know what only the top can prove.** 246 automated tests (layers 1–3) run in seconds and catch logic/wiring regressions on every change; the handful of manual on-VM e2e runs (layer 4) are reserved for the things only the real kernel can confirm. Note what the e2e caught that nothing else could: a bridge-setup race between two real processes, and a cross-node adoption bug that only surfaces when one real node fails while another watches across a resync. Cue: *push coverage down the pyramid (fast, deterministic, runs-anywhere), but never assume the fast layers prove integration with the real world — keep a thin top layer for the kernel/network/hardware truths your mocks asserted on faith.*
 
 ---
 
@@ -2191,3 +2211,328 @@ The transferable haul: **pure-core/imperative-shell as the only viable testing s
 What we did NOT build (scoped out, documented): log compaction/snapshots (the log grows forever), cluster membership changes (fixed 3 nodes), PreVote (we re-randomize timeouts instead), and read-index/lease reads (reads aren't linearizable through the log).
 
 **Phase 6b (next): put the apiserver on top of it.** Writes become `StoreCommand` log entries; three apiserver replicas apply the same log to their own sleds (deterministic rv across replicas — same-log-same-state in action); followers redirect writes to the leader (307 + the leader hint); `--standalone` keeps the single-node path. The agreement machine is built; 6b makes it carry real cargo.
+
+---
+
+# Phase 6b — The replicated apiserver (Raft under the store)
+
+The payoff of the whole project: the single-point-of-failure apiserver (P2) becomes **three replicas that act like one store** and survive any one of them dying. 6a built the agreement machine; 6b makes it carry the apiserver's writes. This is the subtlest section in the note — not because the code is large (three new files, ~400 lines) but because *correctness depends on a discipline that's invisible in any single line*. Read §0 and §2 slowly; they're where the mysteries live.
+
+## 0. The mental model: same log → same state REQUIRES determinism
+
+6a's core promise (§0 there): if every replica has the **same log** and applies it **in the same order**, every replica computes the **same state**. 6b's job is to make every apiserver write go through that log. So a write is no longer "mutate my sled" — it's "propose a command, wait for Raft to commit it to a majority, then apply it to my sled when it comes back as committed." Three replicas, three sleds, one agreed sequence of commands → three identical sleds.
+
+```
+   client ── PUT /pods/web ──► apiserver replica (leader)
+                                  │ 1. build StoreCommand
+                                  │ 2. propose to Raft  ───────► replicate to majority (6a)
+                                  │ 3. ...wait...                       │
+                                  ◄─────────── committed ──────────────┘
+                                  │ 4. apply to MY sled  ──┐
+                                  │ 5. reply 200 + object  │   (every replica also applies,
+                                  ▼                        ▼    in the same order, to ITS sled)
+                              HTTP 200                 sled: web created, rv=7
+   replica 2 sled: web created rv=7  ◄─same commands, same order─►  replica 3 sled: web created rv=7
+```
+
+**But here's the catch that makes 6b hard.** "Same input → same output" is only true if applying a command is a **pure function of (command bytes, current store)** — nothing else. The instant `apply` reads a clock, calls an RNG, or depends on wall-time, two replicas applying the *identical* command produce *different* state, and they silently diverge. The whole phase is a fight to keep apply deterministic.
+
+```
+   ✗ NON-deterministic apply (what breaks):
+     replica 1 apply Create{pod} → uid = random() = "aaa", ts = now() = 10:00:01
+     replica 2 apply Create{pod} → uid = random() = "bbb", ts = now() = 10:00:02
+     → SAME command, DIFFERENT stored objects → divergence → the cluster is lying
+
+   ✓ deterministic apply (what we do):
+     LEADER stamps uid="aaa", ts="10:00:01" INTO the command, ONCE, before proposing
+     every replica apply Create{pod, uid:"aaa", ts:"10:00:01"} → byte-identical object
+```
+
+> **🧭 Design rationale — why "replicate the writes" forces "make apply pure," derived.** You might think replication is about the *network* (get the bytes to peers). It isn't — 6a already did that. The real demand replication places on you is on the *computation*: every replica independently re-runs apply, so apply must be a deterministic function or the replicas you worked so hard to keep in sync produce different answers. This flips a normal instinct — in single-node code, generating a uid or reading a clock *inside* the mutation is the natural place. Under replication, every source of nondeterminism must be hoisted OUT of apply and **pre-computed once** (by the leader) into the command. Reproducible takeaway: *the moment N machines must independently reproduce the same state transition, every clock/RNG/wall-time/iteration-order dependency in that transition becomes a divergence bug — replication is a determinism problem wearing a networking costume.*
+
+## 1. The command language: every write becomes one log entry (`apiserver/command.rs`)
+
+A write is reified into a `StoreCommand` — the thing that gets serialized into a Raft log entry:
+
+```rust
+pub struct StoreCommand {
+    pub id: Uuid,        // correlation id: ties THIS proposer's request to its apply outcome
+    pub kind: String,    // which typed store — a KIND_PREFIX: "pods/", "nodes/", ...
+    pub op: Op,
+}
+pub enum Op {
+    Create { obj: Value },                            // obj FULLY pre-stamped by the leader
+    ReplaceSpec { name: String, obj: Value },
+    ReplaceStatus { name: String, rv: String, status: Value },
+    Delete { name: String, rv: String },
+}
+```
+
+> **🔧 Implementation choice — one command type for all five resources, payloads as `serde_json::Value`.** There's *one* Raft log, carrying writes for pods, nodes, services, replicasets, endpoints. Rather than a per-type log (five consensus groups = five times the election/heartbeat machinery) or a giant enum naming every type, the command carries `kind` (a `KIND_PREFIX` string) + an opaque JSON `Value` payload. `command.rs` stays *ignorant of the five concrete types* — the applier (§3) deserializes per kind. Cue: *when one mechanism must carry many payload types, tag-with-a-discriminator + opaque-payload keeps the transport layer decoupled from the type zoo; reach for it over either N parallel mechanisms or one mechanism that hard-codes every type.*
+>
+> **🦀 Rust pattern — `ApplyOutcome` has NO serde, on purpose.** `StoreCommand` derives Serialize/Deserialize (it crosses the wire into the log); `ApplyOutcome` (the verdict — `Ok(Value)`/`NotFound`/`AlreadyExists`/`Conflict`/`Internal`) deliberately does *not* — it only ever travels in-process, from the apply loop back to the waiting handler via a `oneshot`. Deriving serde on it would invite someone to send it over the network, which would be a design error (verdicts are recomputed locally, never shipped). Cue: *omit `derive(Serialize)` from types that should never leave the process — the absence is a compile-enforced "this is in-process only" annotation.*
+
+## 2. The determinism discipline: pre-stamp + pure allocation
+
+This is §0's "make apply pure" made concrete — two specific leaks plugged.
+
+**Leak 1: uid + creationTimestamp.** A fresh object needs a uid (random) and a creation timestamp (clock). If apply generated them, replicas diverge (the §0 diagram). So the **leader stamps them once, before proposing** — they ride inside the command, and apply just stores what it's given:
+
+```rust
+// meta.rs — the leader calls this ONCE, pre-propose:
+fn stamp_for_create(&mut self) {
+    let m = self.meta_mut();
+    m.uid = Some(uuid::Uuid::new_v4().to_string());        // RNG — leader only
+    m.generation = Some(1);
+    m.creation_timestamp = Some(chrono::Utc::now().to_rfc3339());  // clock — leader only
+    m.resource_version = None;                              // rv assigned at apply (see below)
+}
+// storage.rs — apply path NEVER regenerates; it stores the pre-stamped object:
+pub fn create(&self, mut obj: T) -> Result<T, StoreError> {   // Direct (standalone) mode
+    obj.stamp_for_create();
+    self.create_prestamped(obj)
+}
+pub fn create_prestamped(&self, obj: T) -> Result<T, StoreError> { /* assign rv + insert, NO stamping */ }
+```
+
+Note the elegant detail: `create` (used in standalone Direct mode) stamps-then-delegates; `create_prestamped` (used by every replica's apply) skips stamping. One code path, two entry points — Direct mode is just "stamp and apply on the same machine."
+
+**But why is `resourceVersion` allowed to be assigned at apply time, when uid isn't?** Because rv is *already deterministic*: it's `bump_rv` over the shared counter, and since every replica applies the same commands in the same order, every replica's counter advances identically. rv = "the Nth committed write" — same N everywhere. uid/timestamp are NOT order-derived (they're random/wall-clock), so they must be frozen earlier.
+
+> **🧭 Design rationale — the litmus test for "stamp early vs compute at apply."** Ask of each generated field: *is it a deterministic function of the command stream so far?* If yes (rv = count of writes, derived purely from order), apply can compute it — every replica gets the same answer. If no (uid = randomness, timestamp = wall clock), it must be frozen into the command by the leader before it enters the log. Reproducible takeaway: *in a replicated state machine, a derived value is safe to compute at apply IFF it depends only on prior committed state + this command; anything depending on the outside world (clock, RNG, env) must be captured upstream of the log.*
+
+**Leak 2: resource allocation (the subtle one).** PodCIDR-per-node (`10.244.{n}.0/24`) and ClusterIP-per-service (`10.96.0.{n}`) used to come from a **sled counter** (`next_index`, P4/P5). That counter is a *second piece of state outside the log* — it can't survive a leadership move (a new leader's counter is wherever its sled happened to be) and isn't part of the agreed sequence. The fix: delete the counter, **derive the index by scanning current state**:
+
+```rust
+// Pure: same Node set → same answer on every replica. Replaces the sled counter.
+fn next_free_node_cidr_index(nodes: &[Node]) -> u64 {
+    nodes.iter()
+        .filter_map(|n| n.spec.pod_cidr.as_deref())
+        .filter_map(parse_cidr_index)
+        .max()
+        .map_or(0, |m| m + 1)        // (highest assigned) + 1; first node → 0
+}
+```
+
+> **🔧 Implementation choice — derive allocation from state, don't store a counter.** A `next_index` counter is mutable state that must *itself* be replicated and kept consistent — but it lives outside the command log, so it can't be. Replacing it with "scan existing objects, take max + 1" makes allocation a *pure function of the already-replicated store*, so it's automatically deterministic and survives leadership changes for free. The tradeoff (gaps from deleted resources get reused) is fine at our scale. Cue: *prefer deriving a value from existing replicated state over maintaining a separate counter — a counter is one more thing to keep consistent; a scan over data you already replicate is consistent by construction.* (The same instinct as P5a's "rebuild IPAM from the apiserver, don't persist it locally.")
+
+## 3. The applier: committed commands → the five stores (`apiserver/applier.rs`)
+
+The replicated state machine. It holds the same five store `Arc`s the read handlers use, and `apply(cmd)` dispatches by kind to a generic per-store applier:
+
+```rust
+pub fn apply(&self, cmd: StoreCommand) -> ApplyOutcome {
+    let k = cmd.kind.as_str();
+    if k == Pod::KIND_PREFIX        { apply_op(&self.pods, cmd.op, set_pod_status) }
+    else if k == ReplicaSet::KIND_PREFIX { apply_op(&self.replicasets, cmd.op, set_rs_status) }
+    else if k == Node::KIND_PREFIX  { apply_op(&self.nodes, cmd.op, set_node_status) }
+    else if k == Service::KIND_PREFIX    { apply_op(&self.services, cmd.op, |_, _| {}) } // no status
+    else if k == Endpoints::KIND_PREFIX  { apply_op(&self.endpoints, cmd.op, |_, _| {}) }
+    else { ApplyOutcome::Internal(format!("unknown command kind: {k}")) }
+}
+```
+
+> **🦀 Rust pattern — `if/else` chain, NOT `match`, because `KIND_PREFIX` is a const.** You'd reach for `match cmd.kind.as_str() { Pod::KIND_PREFIX => ... }` — and it would *silently do the wrong thing*. A path like `Pod::KIND_PREFIX` in match-pattern position isn't a comparison; it **binds a new variable** named… well, it's a path so it's a const pattern *only if* it resolves to a const — but associated consts in patterns are a known sharp edge, and the readable intent ("compare to this const") is exactly what match patterns don't give you for non-inline values. So the dispatch is an explicit `if k == Pod::KIND_PREFIX` chain, where `==` is unambiguous. Cue: *match patterns compare against literals and bind identifiers — to branch on equality with a named const/variable, use `if/else` with `==`, not `match`, or you risk a binding that always matches.*
+>
+> **🦀 Rust pattern — generic `apply_op<T: ResourceMeta>` + an injected status closure.** Create/ReplaceSpec/Delete are *identical* across all five types (they only touch `ObjectMeta`, which `ResourceMeta` exposes), so they're written once, generically. The only per-type difference is "where does status live?" — so the status-setter is passed in as `impl Fn(&mut T, Value)`, and Service/Endpoints (no status subresource) pass `|_, _| {}`. Cue: *factor the common shape into one generic function and inject the per-type variation as a closure parameter — beats five near-identical copies or a trait method that most impls leave empty.*
+>
+> **🦀 Rust pattern — `move` + `clone()` in the ReplaceStatus closure.**
+> ```rust
+> Op::ReplaceStatus { name, rv, status } =>
+>     store.replace_status(&name, &rv, move |t| set_status(t, status.clone())),
+> ```
+> `replace_status` takes an `Fn` (not `FnOnce`) because sled may **retry the transaction closure** on contention — so it might call our closure more than once. A closure that *moved* `status` out would compile as `FnOnce` and be unusable; cloning inside keeps it re-runnable. The outer `move` is needed because the closure outlives the match arm. Cue: *if a callback may run more than once (transaction retries, stream combinators), it must be `Fn` not `FnOnce` — clone owned captures inside rather than consuming them.*
+
+The determinism test in this file is the linchpin of the whole phase: **two independent `Applier`s fed the identical command stream end byte-identical** (same objects, same rvs, same uids). If any clock or RNG leaked into apply, that test fails. It's the executable statement of §0.
+
+## 4. The glue: turning an async commit back into an HTTP response (`apiserver/raft_glue.rs`)
+
+Here's the conceptual knot 6b has to untie. An HTTP handler is *synchronous* in spirit: request in, response out. But a Raft write is *asynchronous and distributed*: you propose, and "committed" happens later, on a background loop, after a majority acks — possibly on a different task entirely. How does the handler that proposed get the outcome back? **A `oneshot` channel keyed by the command's id, registered in a shared `pending` map.**
+
+```
+   ── handler side (RaftProposer::submit) ──        ── commit side (apply_loop) ──
+   1. ensure we're the leader (else 307)            (background task, always running)
+   2. make oneshot (tx, rx); pending[cmd.id] = tx
+   3. send cmd bytes to the raft proposer channel        ┌── raft commits the entry ──┐
+   4. await rx  ⟵⟵⟵⟵⟵ parked here ⟵⟵⟵⟵⟵⟵⟵⟵⟵⟵     5. apply_rx yields the committed entry
+                       ▲                                 6. applier.apply(cmd) → outcome
+                       │                                 7. if pending.remove(cmd.id) → tx.send(outcome)
+                       └──────── outcome arrives ────────┘
+   8. map outcome → HTTP (200 / 404 / 409 / 500)
+```
+
+The code, condensed:
+```rust
+pub async fn submit(&self, cmd: StoreCommand) -> Result<Value, ApiError> {
+    self.ensure_leader()?;                                  // only the leader appends
+    let (tx, rx) = oneshot::channel();
+    self.pending.lock().unwrap().insert(cmd.id, tx);        // register BEFORE proposing
+    let bytes = serde_json::to_vec(&cmd)?;
+    if self.prop_tx.send(bytes).await.is_err() { /* remove + error */ }
+    match tokio::time::timeout(WRITE_TIMEOUT, rx).await {   // park until apply resolves us
+        Ok(Ok(outcome)) => outcome_to_result(outcome),
+        _ => { self.pending.lock().unwrap().remove(&cmd.id); Err(/* timed out */) }
+    }
+}
+// the background apply loop:
+let outcome = applier.apply(cmd);
+if let Some(tx) = pending.lock().unwrap().remove(&id) { let _ = tx.send(outcome); }
+```
+
+> **🦀 Rust pattern — `oneshot` + a `pending` map to bridge async-commit → sync-handler.** A `oneshot::channel` is a single-use "I'll send you exactly one value, later." The handler holds the `rx` and `.await`s it; the apply loop holds the `tx` (via the map) and fires it when the matching entry commits. The `Arc<Mutex<HashMap<Uuid, oneshot::Sender>>>` is the rendezvous point between the two halves. Cue: *to turn "fire a request now, get the result from a different task later" into a normal `await`, register a `oneshot` under a correlation id before firing, and have the completer look it up by id — it's the idiomatic request/response bridge across decoupled tasks.*
+>
+> **🔧 Implementation choice — register the oneshot BEFORE proposing.** The order in `submit` is: insert into `pending`, *then* send to the proposer. Reverse it and there's a race: the entry could commit and the apply loop could look for `cmd.id` in `pending` *before the handler inserted it* → the outcome is dropped, the handler waits forever (until the 5s timeout). "Set up the mailbox before you send the letter." Same instinct as 6a's watch "subscribe before snapshot." Cue: *when a response can arrive as soon as you make a request, install the response handler BEFORE making the request — never after.*
+>
+> **🔧 Implementation choice — the 5s timeout + sweep handles "committed never happens."** A write can be proposed and then *never commit* — leadership lost mid-flight, the entry gets overwritten by a new leader (6a §7). The handler can't park forever, so `submit` wraps `rx` in a 5s timeout and, on expiry, removes its own `pending` entry (or it leaks). The client sees a 500 "not committed" and may retry. This is honest at-least-once-on-failover semantics (documented, not hidden). Cue: *any "wait for a distributed outcome" must have a timeout AND clean up the state it registered — an un-swept pending map is a slow memory leak under failure.*
+>
+> **🧭 Design rationale — why followers apply too, and why that's not wasteful.** The apply loop runs on *every* replica, not just the leader — that's the whole point (same log → same state needs everyone to apply). But only the *proposing* replica has a `pending` entry for a given id; followers apply the command, look for the id, find nothing, and move on (`pending.remove(id)` returns `None`). So the same loop serves double duty: it advances every replica's store AND resolves the local proposer's waiter, with no special-casing. Reproducible takeaway: *in a replicated state machine the apply path is universal (everyone runs it); the request/response correlation is local (only the proposer waits) — one loop cleanly does both because a missing correlation id is simply a no-op.*
+
+## 5. WritePath: one codebase, standalone OR replicated (`apiserver/handlers.rs`)
+
+A crucial design constraint: 6b must not fork the apiserver into "the simple one" and "the Raft one." Both modes share every handler. The switch is one enum on `AppState`:
+
+```rust
+pub enum WritePath {
+    Direct,                  // standalone: mutate the local store inline (pre-6b behavior)
+    Raft(RaftProposer),      // replicated: propose through the log, await commit
+}
+impl AppState {
+    pub fn raft(&self) -> Option<&RaftProposer> {
+        match &self.write { WritePath::Raft(p) => Some(p), WritePath::Direct => None }
+    }
+}
+```
+
+Every mutating handler is the same shape — `raft()` is `Some` → propose; `None` → mutate inline:
+```rust
+pub async fn create_pod(State(state): State<AppState>, Json(pod): Json<Pod>) -> Result<Response, ApiError> {
+    validate_pod(&pod)?;
+    if let Some(raft) = state.raft() {
+        let mut pod = pod;
+        pod.stamp_for_create();                            // leader stamps once (§2)
+        let v = raft.submit(create_cmd(&pod)?).await?;     // propose → commit → apply → outcome
+        return Ok((StatusCode::CREATED, Json(v)).into_response());
+    }
+    let created = state.store.create(pod)?;                 // Direct: inline (also stamps, §2)
+    Ok((StatusCode::CREATED, Json(created)).into_response())
+}
+```
+Reads and watches don't branch at all — they *always* hit the local store (§7).
+
+> **🧭 Design rationale — why keep Direct mode at all, instead of "Raft everywhere"?** It would be simpler to delete Direct and always go through the log. Three reasons not to: (1) **dev/test ergonomics** — a single-node Direct apiserver has no election latency, no quorum, instant writes; every pre-6b test runs unchanged in Direct mode (the 229 tests didn't move). (2) **the seam proves the abstraction** — if reads/watches and the store API are identical in both modes, you've demonstrated that consensus is a *write-path concern*, cleanly separable from everything else. (3) **graceful degradation of complexity** — you can develop a feature in Direct mode and get replication for free. Reproducible takeaway: *when adding a heavyweight capability (consensus, caching, sharding), gate it behind an enum/flag so the simple path survives — it keeps your tests fast, isolates the new complexity to one branch, and the fact that both paths share everything downstream is itself proof you cut the abstraction in the right place.*
+>
+> **🦀 Rust pattern — `Option<&RaftProposer>` via `raft()` as the mode test.** Rather than `match self.write` in all 14 handlers, `AppState::raft()` collapses the enum to an `Option`, so each handler reads `if let Some(raft) = state.raft()`. The `Direct` arm needs no data, the `Raft` arm carries the proposer — exactly `Option`'s shape. Cue: *when a two-variant enum is "absent vs present-with-payload" at every use site, expose an `Option<&Payload>` accessor so callers use familiar `if let Some` instead of repeating the match.*
+
+## 6. Follower redirects and the read-before-write trap
+
+Only the leader may append to the log. A write that lands on a *follower* must get to the leader. The mechanism: the follower replies **HTTP 307 Temporary Redirect** with the leader's URL, and the client re-sends.
+
+```rust
+pub fn ensure_leader(&self) -> Result<(), ApiError> {
+    match *self.leader_rx.borrow() {
+        Some(l) if l == self.id => Ok(()),                          // I'm the leader → proceed
+        Some(l) => Err(ApiError::Redirect(self.peer_apis[&l].clone())),  // 307 to the leader
+        None => Err(ApiError::Internal("no leader elected yet; retry".into())),
+    }
+}
+```
+
+> **🔧 Implementation choice — 307, not 301/302, and why `reqwest` needs zero changes.** The redirect status matters: 301/302 let the client downgrade the method to GET and drop the body (ancient browser behavior), which would turn a `POST /pods` into a `GET` of nothing. **307 Temporary Redirect preserves method AND body** — so the follower's 307 makes `reqwest` (which follows redirects by default) re-send the exact same `POST`/`PUT` with its JSON body to the leader. The client code is completely unaware redirection happened — no failover logic in `Client` at all. Cue: *to bounce a mutating HTTP request to another node transparently, use 307/308 (method+body preserving), never 301/302 — then a standard redirect-following client needs no special-casing.*
+>
+> **🔧 Implementation choice — the `append_path_to_redirect` middleware.** `ensure_leader` only knows the leader's *base* URL (`http://host:port`) — not which endpoint the client was hitting. So a bare 307 to the base would lose the path. A middleware layer notices a `Location` that's just a bare base (exactly two `/`) and appends the original request's path+query, so the client lands on the *same* endpoint at the leader. Cue: *a component that issues a redirect often knows only "which host," not "which path" — reconstruct the full target in a middleware that still has the original request in scope.*
+
+**The read-before-write trap.** Three handlers — `bind_pod`, `create_node`, `create_service` — *read state before they write* (bind reads the pod then sets nodeName; the create-allocators scan existing nodes/services for the next free index, §2). On a follower, that read hits a **possibly-stale local store**. If a follower read its own lagging copy and then proposed based on it, it could allocate a duplicate ClusterIP or bind a pod it has a stale view of. The fix: those handlers call `ensure_leader()` **first**, before the read — so a follower redirects *before* reading, and the read always happens on the leader (whose store is current):
+
+```rust
+pub async fn bind_pod(State(state): State<AppState>, ...) -> Result<Response, ApiError> {
+    if let Some(raft) = state.raft() {
+        raft.ensure_leader()?;        // ← gate FIRST: redirect before the (possibly-stale) read
+    }
+    let mut pod = state.store.get(&name)?...;     // now guaranteed to read the leader's store
+    // ... mutate, then propose as ReplaceSpec
+}
+```
+
+> **🧭 Design rationale — read-modify-write under replication must read on the leader.** A plain write (full object given) can be proposed from anywhere — the redirect inside `submit` handles it. But a *read*-modify-write computes the new value from current state, and on a follower "current state" can be behind. The subtlety: the redirect normally lives *inside* `submit` (after the read), which is too late — the stale read already happened. So these handlers hoist the leadership check to before the read. Reproducible takeaway: *in a leader-based system, a write that depends on a prior read must perform that read on the leader; gate leadership before the read, not before the write, or you compute the mutation from stale data.* (This is exactly why etcd/K8s reads can be "linearizable" vs "serializable" — we chose the cheap path for plain reads, §7, but RMW writes can't afford it.)
+
+## 7. Reads are local: the deliberate staleness tradeoff
+
+Reads and watches **never go through Raft** — they serve straight from the local sled, on any replica, leader or follower. This is a real, *chosen* consistency tradeoff, not an oversight.
+
+```
+   GET /pods/web on a FOLLOWER that's slightly behind:
+     → returns that follower's local copy, which may be one or two commits stale
+   The write that created web committed on the majority, but THIS follower's
+   apply loop might not have caught up yet → the read can miss a just-written value.
+```
+
+> **🧭 Design rationale — why accept stale reads (and when you couldn't).** Making reads linearizable (always see the latest committed write) requires routing them through the log too, or a "ReadIndex" round-trip to the leader to confirm you're current — real cost on every read. We chose **local reads**: cheap, scale across all replicas, but a follower can serve slightly stale data. Why it's acceptable *here*: K8s controllers are level-triggered (P1/P3) — they reconcile from watch streams and re-resync, so a momentarily stale read self-corrects on the next pass. The system is *eventually consistent* on reads and that's enough because every consumer is built to converge. It would NOT be acceptable if a reader made an irreversible decision on a single read (transferring money) — there you'd pay for ReadIndex. Reproducible takeaway: *consistency is a cost knob, not a binary — match read strength to what the reader does with the value; level-triggered consumers tolerate staleness by construction, so don't buy linearizable reads they don't need.* (Documented cut: no ReadIndex/lease reads.)
+
+## 8. Assembly: the apiserver binary in two modes (`bin/apiserver.rs`)
+
+The bin wires it together. `--raft-id` present → Raft mode; absent → Direct (the default, so every earlier phase's single apiserver still works):
+
+```rust
+let (write, raft_proposer) = match args.raft_id {
+    Some(id) => {
+        let peer_apis = parse_peers(&args.peers)?;                 // id → base URL map
+        let applier = Applier { pods: store.clone(), /* ...5 stores, SHARED with reads... */ };
+        let seed = /* SystemTime nanos | 1 — different election timeouts per replica */;
+        let proposer = spawn_raft(id, peers, peer_apis, RaftStorage::open(&db)?, applier, seed, cancel)?;
+        (WritePath::Raft(proposer.clone()), Some(proposer))
+    }
+    None => (WritePath::Direct, None),                             // standalone
+};
+let mut app = router(state);
+if let Some(proposer) = raft_proposer {
+    app = app.merge(Router::new().route(RAFT_MESSAGE_PATH, post(raft_message)).with_state(proposer))
+             .layer(axum::middleware::from_fn(append_path_to_redirect));
+}
+```
+
+Two assembly subtleties worth noting: the `Applier` shares the **same five store `Arc`s** the read handlers serve from (writes and reads hit one store per replica), and **Raft rides the apiserver's own HTTP port** — peers POST to `/raft/message` on the same server that serves the API, so there's one listener, not two.
+
+> **🦀 Rust pattern — `Router::merge` to compose sub-routers with different state.** The API routes carry `AppState`; the `/raft/message` route needs `RaftProposer` instead. `merge` composes two routers *after each has its own state applied* (`.with_state(...)`), so they coexist on one server without forcing a single shared state type. Cue: *when two route groups need different state, give each its own `with_state` and `merge` them, rather than inventing a god-state struct that carries both.*
+>
+> **🔧 Implementation choice — `--raft-id` presence as the mode switch.** No `--mode=raft|direct` flag; the *presence* of `--raft-id` is the signal. It's impossible to be in Raft mode without an id (you'd have nothing to call yourself), so binding the mode to the id's presence makes an illegal combination unrepresentable at the CLI. Cue: *let a required-for-the-mode argument's presence select the mode, rather than a separate flag that can contradict it.*
+
+## 9. e2e: three apiservers, kill the leader (validation)
+
+See the [[#How validation works in this project|Validation catalog]] → "Phase 6b" for the full run. The shape: three `apiserver --raft-id N --peers ...` processes (one sled each), then —
+- a write sent to a **follower** returns 307 → client re-sends to the leader → 201; all three replicas' stores converge to byte-identical contents (same objects, same rvs).
+- **kill the leader** mid-operation → a survivor wins a new election → writes sent to a survivor still commit (the cluster tolerates one failure of three).
+- a committed write is durable on the survivors; a not-yet-caught-up follower briefly serving a stale local read was *observed and explained* — the §7 tradeoff, live.
+
+> **🔧 Ops gotcha — OrbStack SSH teardown kills detached processes.** `setsid`/`nohup`/`systemd-run` all die when the spawning SSH session closes (the process group/scope is killed on disconnect). So the multi-process e2e can't "start daemons, disconnect, reconnect to test" — it must run as ONE self-contained `ssh 'bash -s' <<SCRIPT` that launches all three replicas, runs the test, and tears down *before* the session ends. (Single-process or in-process tests are unaffected.) Cue: *backgrounding a daemon over SSH doesn't outlive the session unless it's truly detached from the login scope — for multi-daemon integration tests, keep launch+test+teardown inside one session.*
+
+## Phase 6b wrap — what this earned us
+
+A **fault-tolerant control plane**: three apiserver replicas that agree on one store via Raft, survive any single failure, and present the same API as the single-node version — reads local, writes through the log, followers redirecting transparently. The single point of failure that the apiserver was since P2 is gone.
+
+The transferable haul: **replication is a determinism problem** (hoist every clock/RNG/counter out of apply; derive what you can from replicated state, pre-stamp what you can't); the **command/apply/oneshot pattern** for turning async distributed commits into synchronous responses (register-before-propose, correlation id, timeout-and-sweep); **307 for transparent write forwarding** (method+body preserving → zero client changes); **gate leadership before a read-modify-write's read**; **consistency as a tunable cost** (local reads are fine when consumers are level-triggered); and **gate heavyweight capability behind an enum** so the simple path and its tests survive. Rust-wise: `oneshot`+`pending`-map task bridging, generic apply + injected closures, `if/else` over `match` for const dispatch, `Fn`-not-`FnOnce` for retryable closures, `Router::merge` for mixed-state composition, and `Option<&T>` accessors over repeated enum matches.
+
+What we did NOT build (documented cuts): log compaction/snapshots (the Raft log grows forever), client-side leader caching (every follower write pays one redirect hop), ReadIndex/lease reads (reads are local-stale), and Raft membership changes (fixed replica set). Each is a known next step, not a hidden gap.
+
+---
+
+# Project retrospective — what the whole thing earned
+
+Six phases, one throughline: **a from-scratch mini-Kubernetes that actually runs containers, schedules them across nodes, networks them, load-balances Services, and replicates its control plane with hand-written Raft.** Built bottom-up, each phase the foundation for the next:
+
+```
+   P0  dev env + libcontainer tracer bullet
+   P1  kubelet: the Pod sandbox (pause container, reconcile loop, CrashLoopBackOff)
+   P2  apiserver: REST + watch + sled persistence; kubelet becomes a client
+   P3  controllers: the ReplicaSet reconcile loop (the pattern K8s is built from)
+   P4  scheduler + multi-node: placement as data, heartbeat liveness, fieldSelector
+   P5  real pod networking (veth/bridge, IPAM) + Services (ClusterIP, endpoints, iptables)
+   P6  Raft from scratch (6a), then the apiserver replicated on top of it (6b)
+```
+
+**The one idea that recurs in every phase** is the *reconcile loop / level-triggered control*: observe desired, observe actual, drive the difference to zero, idempotently, triggered by watches but correct even without them. It's the kubelet (P1), the status reporter (P2), the ReplicaSet controller (P3), the scheduler (P4), the endpoints controller and kube-proxy (P5b) — and Raft's own apply loop is the same shape one level down. Internalizing that single pattern is most of what it means to understand Kubernetes from the inside.
+
+**The engineering judgment that generalizes** (the whole [[#Engineering principles, by example|principles index]]): program-to-an-interface seams that double as test seams (the `RuntimeClient` trait, the `Transport` trait); functional-core/imperative-shell taken from a testing convenience (kube-proxy planner) to a correctness necessity (the Raft core); level-triggered over edge-triggered everywhere; optimistic concurrency for shared state; separate decision from execution (scheduler) and control from dataplane (kube-proxy); partition to avoid coordination (per-node /24s); and — the capstone — replication as a determinism discipline. None of these are K8s-specific; they're how you build distributed systems.
+
+**What this is NOT** (honest scope): not production (no auth/RBAC, no TLS, no admission control, no resource limits/quotas, single-host "multi-node", no snapshots/compaction). It was never meant to be — it's the *implementer's-eye view*, built to understand, with every shortcut documented as a shortcut. The README-level pitch: *I wrote Kubernetes' core control loops and a Raft consensus engine from scratch in Rust, with a deterministic simulation test suite, to understand distributed systems from the inside.*
+
+Optional future tracks (each a clean separate project): harden the Raft into a standalone `my-raft` (snapshots, ReadIndex, membership changes); add auth/RBAC; real CNI; admission webhooks. The foundation is laid.
