@@ -12,17 +12,32 @@ use thiserror::Error;
 use tokio_stream::StreamExt;
 use tracing::warn;
 
+use serde_json::Value;
+use uuid::Uuid;
+
 use crate::{
     apiserver::{
+        command::{Op, StoreCommand},
+        raft_glue::RaftProposer,
         storage::{PodStore, ResourceStore, StoreError},
         watch::stream_events,
     },
     endpoints::Endpoints,
+    meta::ResourceMeta,
     node::{Node, NodeStatus},
     pod::{Pod, PodStatus},
     replicaset::{ReplicaSet, ReplicaSetStatus},
     service::Service,
 };
+
+/// Where mutating handlers send writes. `Direct` (standalone, the default)
+/// calls the store inline as today; `Raft` proposes the write through the log
+/// and waits for it to commit + apply. Reads/watches ignore this — always local.
+#[derive(Clone)]
+pub enum WritePath {
+    Direct,
+    Raft(RaftProposer),
+}
 
 /// Shared handler state. `Arc<PodStore>` so every handler (and every spawned
 /// watch-stream future) shares ONE store cheaply. `#[derive(Clone)]` is
@@ -35,6 +50,38 @@ pub struct AppState {
     pub node_store: Arc<ResourceStore<Node>>,
     pub svc_store: Arc<ResourceStore<Service>>,
     pub ep_store: Arc<ResourceStore<Endpoints>>,
+    pub write: WritePath,
+}
+
+impl AppState {
+    /// `Some(proposer)` in Raft mode, `None` in Direct mode — mutating handlers
+    /// branch on this.
+    pub fn raft(&self) -> Option<&RaftProposer> {
+        match &self.write {
+            WritePath::Raft(p) => Some(p),
+            WritePath::Direct => None,
+        }
+    }
+}
+
+/// Wrap an op into a command with a fresh correlation id (the random uuid here
+/// is the request↔commit key — NOT applied state, so it's safe to generate).
+fn cmd(kind: &str, op: Op) -> StoreCommand {
+    StoreCommand {
+        id: Uuid::new_v4(),
+        kind: kind.to_string(),
+        op,
+    }
+}
+
+/// A create command for an already-stamped object.
+fn create_cmd<T: ResourceMeta>(obj: &T) -> Result<StoreCommand, ApiError> {
+    Ok(cmd(T::KIND_PREFIX, Op::Create { obj: to_value(obj)? }))
+}
+
+/// Serialize to JSON for a command payload, mapping failure to a 500.
+fn to_value<T: serde::Serialize>(obj: &T) -> Result<Value, ApiError> {
+    serde_json::to_value(obj).map_err(|e| ApiError::Internal(format!("encode payload: {e}")))
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +124,8 @@ pub enum ApiError {
     BadRequest(String),
     #[error("internal: {0}")]
     Internal(String),
+    #[error("redirect to {0}")]
+    Redirect(String),
 }
 
 // `From<StoreError>` lets handlers use `?` on store calls: the storage-layer
@@ -100,12 +149,26 @@ impl From<StoreError> for ApiError {
 // the K8s-style machine-readable error shape, keyed on `reason`.
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // A follower redirects writes to the leader. 307 (not 301/302) is
+        // required: it preserves the method + body, so reqwest re-sends the
+        // PUT/POST unchanged. `url` is the leader's API base; the path is
+        // appended by the redirect handler in routes (6b-5). For now (single
+        // node) this branch never fires.
+        if let ApiError::Redirect(url) = &self {
+            return Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header("location", url.clone())
+                .body(Body::empty())
+                .expect("redirect response");
+        }
         let (statue_code, reason) = match &self {
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "NotFound"),
             ApiError::AlreadyExists(_) => (StatusCode::CONFLICT, "AlreadyExists"),
             ApiError::Conflict { .. } => (StatusCode::CONFLICT, "Conflict"),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "BadRequest"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Internal"),
+            // Handled by the early-return above; never reached here.
+            ApiError::Redirect(_) => unreachable!("redirect handled before this match"),
         };
 
         let body = Status {
@@ -199,6 +262,13 @@ pub async fn create_pod(
     Json(pod): Json<Pod>,
 ) -> Result<Response, ApiError> {
     validate_pod(&pod)?;
+    if let Some(raft) = state.raft() {
+        // Leader stamps uid/ts ONCE, then proposes the fully-formed object.
+        let mut pod = pod;
+        pod.stamp_for_create();
+        let v = raft.submit(create_cmd(&pod)?).await?;
+        return Ok((StatusCode::CREATED, Json(v)).into_response());
+    }
     let created = state.store.create(pod)?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
@@ -226,6 +296,14 @@ pub async fn replace_pod_spec(
             pod.metadata.name
         )));
     }
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceSpec {
+            name: name.clone(),
+            obj: to_value(&pod)?,
+        };
+        let v = raft.submit(cmd(Pod::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state.store.replace_spec(&name, pod)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
@@ -238,6 +316,14 @@ pub async fn delete_pod(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::Delete {
+            name: name.clone(),
+            rv: rv.clone(),
+        };
+        let v = raft.submit(cmd(Pod::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let deleted = state.store.delete(&name, &rv.to_string())?;
     Ok((StatusCode::OK, Json(deleted)).into_response())
 }
@@ -251,6 +337,15 @@ pub async fn replace_pod_status(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceStatus {
+            name: name.clone(),
+            rv: rv.clone(),
+            status: to_value(&status)?,
+        };
+        let v = raft.submit(cmd(Pod::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state
         .store
         .replace_status(&name, &rv, |p| p.status = Some(status.clone()))?;
@@ -272,11 +367,26 @@ pub async fn bind_pod(
         ));
     }
 
+    // Read-modify-write. In Raft mode the READ must happen on the leader (its
+    // store is current), so gate leadership FIRST — a follower redirects before
+    // reading a possibly-stale local copy. The mutated pod is then proposed as a
+    // ReplaceSpec; rv carried in metadata gives the optimistic-concurrency check.
+    if let Some(raft) = state.raft() {
+        raft.ensure_leader()?;
+    }
     let mut pod = state
         .store
         .get(&name)?
         .ok_or_else(|| ApiError::NotFound(name.clone()))?;
     pod.spec.node_name = Some(binding.node_name);
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceSpec {
+            name: name.clone(),
+            obj: to_value(&pod)?,
+        };
+        let v = raft.submit(cmd(Pod::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state.store.replace_spec(&name, pod)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
@@ -348,6 +458,12 @@ pub async fn create_replicaset(
     Json(rs): Json<ReplicaSet>,
 ) -> Result<Response, ApiError> {
     validate_replicaset(&rs)?;
+    if let Some(raft) = state.raft() {
+        let mut rs = rs;
+        rs.stamp_for_create();
+        let v = raft.submit(create_cmd(&rs)?).await?;
+        return Ok((StatusCode::CREATED, Json(v)).into_response());
+    }
     let created = state.rs_store.create(rs)?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
@@ -375,6 +491,14 @@ pub async fn replace_replicaset_spec(
             rs.metadata.name
         )));
     }
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceSpec {
+            name: name.clone(),
+            obj: to_value(&rs)?,
+        };
+        let v = raft.submit(cmd(ReplicaSet::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state.rs_store.replace_spec(&name, rs)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
@@ -387,6 +511,14 @@ pub async fn delete_replicaset(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::Delete {
+            name: name.clone(),
+            rv: rv.clone(),
+        };
+        let v = raft.submit(cmd(ReplicaSet::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let deleted = state.rs_store.delete(&name, &rv)?;
     Ok((StatusCode::OK, Json(deleted)).into_response())
 }
@@ -400,6 +532,15 @@ pub async fn replace_replicaset_status(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceStatus {
+            name: name.clone(),
+            rv: rv.clone(),
+            status: to_value(&status)?,
+        };
+        let v = raft.submit(cmd(ReplicaSet::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state
         .rs_store
         .replace_status(&name, &rv, |rs| rs.status = Some(status.clone()))?;
@@ -537,6 +678,11 @@ pub async fn create_node(
     Json(mut node): Json<Node>,
 ) -> Result<Response, ApiError> {
     validate_node(&node)?;
+    // Gate leadership BEFORE the allocation reads below — a follower must
+    // redirect, not compute a CIDR off its (possibly stale) local store.
+    if let Some(raft) = state.raft() {
+        raft.ensure_leader()?;
+    }
     // Assign a /24 PodCIDR only if the node didn't bring its own AND isn't
     // already registered. The get()-guard means a kubelet RESTART (which
     // re-POSTs the same node) doesn't burn a fresh slice — `create` below will
@@ -550,6 +696,11 @@ pub async fn create_node(
             )));
         }
         node.spec.pod_cidr = Some(format!("{CLUSTER_POD_CIDR_PREFIX}.{idx}.0/24"));
+    }
+    if let Some(raft) = state.raft() {
+        node.stamp_for_create();
+        let v = raft.submit(create_cmd(&node)?).await?;
+        return Ok((StatusCode::CREATED, Json(v)).into_response());
     }
     let created = state.node_store.create(node)?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
@@ -578,6 +729,14 @@ pub async fn replace_node_spec(
             node.metadata.name
         )));
     }
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceSpec {
+            name: name.clone(),
+            obj: to_value(&node)?,
+        };
+        let v = raft.submit(cmd(Node::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state.node_store.replace_spec(&name, node)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
@@ -590,6 +749,14 @@ pub async fn delete_node(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::Delete {
+            name: name.clone(),
+            rv: rv.clone(),
+        };
+        let v = raft.submit(cmd(Node::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let deleted = state.node_store.delete(&name, &rv)?;
     Ok((StatusCode::OK, Json(deleted)).into_response())
 }
@@ -603,6 +770,15 @@ pub async fn replace_node_status(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceStatus {
+            name: name.clone(),
+            rv: rv.clone(),
+            status: to_value(&status)?,
+        };
+        let v = raft.submit(cmd(Node::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state
         .node_store
         .replace_status(&name, &rv, |n| n.status = Some(status.clone()))?;
@@ -675,6 +851,10 @@ pub async fn create_service(
     Json(mut svc): Json<Service>,
 ) -> Result<Response, ApiError> {
     validate_service(&svc)?;
+    // Gate leadership before the ClusterIP allocation reads (see create_node).
+    if let Some(raft) = state.raft() {
+        raft.ensure_leader()?;
+    }
     if svc.spec.cluster_ip.is_none() && state.svc_store.get(&svc.metadata.name)?.is_none() {
         let (services, _) = state.svc_store.list()?;
         let idx = next_free_cluster_ip_index(&services);
@@ -684,6 +864,11 @@ pub async fn create_service(
             )));
         }
         svc.spec.cluster_ip = Some(format!("{SERVICE_CIDR_PREFIX}.{idx}"));
+    }
+    if let Some(raft) = state.raft() {
+        svc.stamp_for_create();
+        let v = raft.submit(create_cmd(&svc)?).await?;
+        return Ok((StatusCode::CREATED, Json(v)).into_response());
     }
     let created = state.svc_store.create(svc)?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
@@ -712,6 +897,14 @@ pub async fn replace_service_spec(
             svc.metadata.name
         )));
     }
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceSpec {
+            name: name.clone(),
+            obj: to_value(&svc)?,
+        };
+        let v = raft.submit(cmd(Service::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state.svc_store.replace_spec(&name, svc)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
@@ -724,6 +917,14 @@ pub async fn delete_service(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::Delete {
+            name: name.clone(),
+            rv: rv.clone(),
+        };
+        let v = raft.submit(cmd(Service::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let deleted = state.svc_store.delete(&name, &rv)?;
     Ok((StatusCode::OK, Json(deleted)).into_response())
 }
@@ -785,6 +986,12 @@ pub async fn create_endpoints(
             "metadata.name must not be empty".into(),
         ));
     }
+    if let Some(raft) = state.raft() {
+        let mut ep = ep;
+        ep.stamp_for_create();
+        let v = raft.submit(create_cmd(&ep)?).await?;
+        return Ok((StatusCode::CREATED, Json(v)).into_response());
+    }
     let created = state.ep_store.create(ep)?;
     Ok((StatusCode::CREATED, Json(created)).into_response())
 }
@@ -811,6 +1018,14 @@ pub async fn replace_endpoints(
             ep.metadata.name
         )));
     }
+    if let Some(raft) = state.raft() {
+        let op = Op::ReplaceSpec {
+            name: name.clone(),
+            obj: to_value(&ep)?,
+        };
+        let v = raft.submit(cmd(Endpoints::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let updated = state.ep_store.replace_spec(&name, ep)?;
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
@@ -823,6 +1038,14 @@ pub async fn delete_endpoints(
     let rv = params
         .resource_version
         .ok_or_else(|| ApiError::BadRequest("resourceVersion query param required".into()))?;
+    if let Some(raft) = state.raft() {
+        let op = Op::Delete {
+            name: name.clone(),
+            rv: rv.clone(),
+        };
+        let v = raft.submit(cmd(Endpoints::KIND_PREFIX, op)).await?;
+        return Ok((StatusCode::OK, Json(v)).into_response());
+    }
     let deleted = state.ep_store.delete(&name, &rv)?;
     Ok((StatusCode::OK, Json(deleted)).into_response())
 }
@@ -871,6 +1094,7 @@ mod tests {
             node_store: node_store.clone(),
             svc_store: svc_store.clone(),
             ep_store: ep_store.clone(),
+            write: WritePath::Direct,
         });
         (app, pod_store, rs_store, node_store, svc_store, ep_store)
     }

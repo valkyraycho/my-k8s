@@ -57,6 +57,21 @@ pub trait ResourceMeta: Clone + Serialize + DeserializeOwned + Send + Sync + 'st
     /// Preserve existing status across a spec replace (status changes only via
     /// the `/status` subresource, never a spec PUT).
     fn inherit_status(&mut self, _current: &Self) {}
+
+    /// Stamp the fields a fresh create assigns (uid, generation, timestamp).
+    /// In Raft mode the LEADER calls this ONCE pre-propose, so uid/timestamp
+    /// are baked into the command — followers apply via `create_prestamped` and
+    /// never regenerate them (that would diverge replicas).
+    fn stamp_for_create(&mut self) {
+        {
+            let m = self.meta_mut();
+            m.uid = Some(uuid::Uuid::new_v4().to_string());
+            m.generation = Some(1);
+            m.creation_timestamp = Some(chrono::Utc::now().to_rfc3339());
+            m.resource_version = None;
+        }
+        self.clear_status();
+    }
 }
 
 #[cfg(test)]

@@ -55,7 +55,10 @@ impl<T: Transport> RaftShell<T> {
         leader_watch: watch::Sender<Option<NodeId>>,
         seed: u64,
     ) -> anyhow::Result<Self> {
-        let mut rng = XorShift(seed ^ id);
+        // Mix id with a golden-ratio multiplier, NOT XOR: `seed ^ id` can
+        // CANCEL (e.g. seed=1000+id ^ id collapses to 1000 for every id),
+        // giving every node the same election timeout → permanent split vote.
+        let mut rng = XorShift(seed.wrapping_add(id.wrapping_mul(0x9E37_79B9_7F4A_7C15)));
         let timeout = ELECTION_TICK_MIN + (rng.next() % ELECTION_TICK_JITTER) as u32;
         let mut node = RaftNode::new(id, peers, timeout);
 

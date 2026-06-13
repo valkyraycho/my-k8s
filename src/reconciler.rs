@@ -1411,6 +1411,7 @@ mod tests {
             ep_store: Arc::new(
                 ResourceStore::<crate::endpoints::Endpoints>::from_db(db).unwrap(),
             ),
+            write: crate::apiserver::handlers::WritePath::Direct,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

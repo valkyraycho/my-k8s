@@ -124,6 +124,7 @@ mod tests {
             node_store: Arc::new(ResourceStore::from_db(db.clone()).unwrap()),
             svc_store: Arc::new(ResourceStore::from_db(db.clone()).unwrap()),
             ep_store: Arc::new(ResourceStore::from_db(db).unwrap()),
+            write: crate::apiserver::handlers::WritePath::Direct,
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

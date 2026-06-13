@@ -9,7 +9,6 @@ use crate::{
     meta::ResourceMeta,
     pod::Pod,
 };
-use chrono::Utc;
 // `as TxnAbort`: import-rename to shorten the very long `Conflictable...` name
 // at every use site. The two sled error types matter (see `unwrap_txn` below).
 use sled::transaction::{ConflictableTransactionError as TxnAbort, TransactionError};
@@ -140,14 +139,9 @@ impl<T: ResourceMeta> ResourceStore<T> {
     }
 
     pub fn create(&self, mut obj: T) -> Result<T, StoreError> {
-        {
-            let m = obj.meta_mut();
-            m.uid = Some(uuid::Uuid::new_v4().to_string());
-            m.generation = Some(1);
-            m.creation_timestamp = Some(Utc::now().to_rfc3339());
-            m.resource_version = None;
-        }
-        obj.clear_status();
+        // One source of truth for create-stamping, shared with the Raft leader
+        // path. Direct mode behaviour is unchanged.
+        obj.stamp_for_create();
         self.create_prestamped(obj)
     }
 

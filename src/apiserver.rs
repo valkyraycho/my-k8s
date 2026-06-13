@@ -8,6 +8,7 @@
 pub mod applier;
 pub mod command;
 pub mod handlers;
+pub mod raft_glue;
 pub mod routes;
 pub mod storage;
 pub mod watch;
