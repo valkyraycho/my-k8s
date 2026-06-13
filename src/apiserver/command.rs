@@ -22,10 +22,22 @@ pub struct StoreCommand {
 pub enum Op {
     /// Object FULLY pre-stamped by the leader (uid, creationTimestamp) — apply
     /// must never generate randomness or read clocks.
-    Create { obj: Value },
-    ReplaceSpec { name: String, obj: Value },
-    ReplaceStatus { name: String, rv: String, status: Value },
-    Delete { name: String, rv: String },
+    Create {
+        obj: Value,
+    },
+    ReplaceSpec {
+        name: String,
+        obj: Value,
+    },
+    ReplaceStatus {
+        name: String,
+        rv: String,
+        status: Value,
+    },
+    Delete {
+        name: String,
+        rv: String,
+    },
 }
 
 /// The deterministic verdict every replica reaches independently. Mirrors
@@ -37,7 +49,11 @@ pub enum ApplyOutcome {
     Ok(Value),
     NotFound(String),
     AlreadyExists(String),
-    Conflict { current: String, provided: String },
+    Conflict {
+        current: String,
+        provided: String,
+    },
+    Internal(String),
 }
 
 #[cfg(test)]

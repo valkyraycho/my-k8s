@@ -148,7 +148,14 @@ impl<T: ResourceMeta> ResourceStore<T> {
             m.resource_version = None;
         }
         obj.clear_status();
+        self.create_prestamped(obj)
+    }
 
+    /// `create` minus uid/timestamp generation — the object arrives already
+    /// stamped (the Raft leader did it once, pre-propose). Every replica runs
+    /// THIS on the committed command, so no clock/RNG at apply → identical
+    /// stores. rv is still assigned here (deterministic: apply order matches).
+    pub fn create_prestamped(&self, obj: T) -> Result<T, StoreError> {
         let name = obj.meta().name.clone();
         let key = self.key(&name);
 
@@ -405,6 +412,34 @@ mod tests {
         assert!(created.metadata.creation_timestamp.is_some());
         assert_eq!(created.metadata.resource_version.as_deref(), Some("1"));
         assert!(created.status.is_none(), "status not set on create");
+    }
+
+    #[test]
+    fn create_prestamped_preserves_uid_and_timestamp_but_assigns_rv() {
+        let store = store();
+        // The leader's pre-stamped object: uid + creationTimestamp already set.
+        let mut pod = make_pod("web");
+        pod.metadata.uid = Some("leader-uid-123".into());
+        pod.metadata.creation_timestamp = Some("2026-06-12T10:00:00Z".into());
+
+        let created = store.create_prestamped(pod).expect("create_prestamped");
+
+        // Determinism: the stamped fields are TRUSTED, not regenerated.
+        assert_eq!(created.metadata.uid.as_deref(), Some("leader-uid-123"));
+        assert_eq!(
+            created.metadata.creation_timestamp.as_deref(),
+            Some("2026-06-12T10:00:00Z")
+        );
+        // rv is still assigned here (deterministic — apply order is identical).
+        assert_eq!(created.metadata.resource_version.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn create_prestamped_still_rejects_duplicates() {
+        let store = store();
+        store.create_prestamped(make_pod("web")).unwrap();
+        let err = store.create_prestamped(make_pod("web")).unwrap_err();
+        assert!(matches!(err, StoreError::AlreadyExists(ref n) if n == "web"));
     }
 
     #[test]

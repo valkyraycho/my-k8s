@@ -438,10 +438,42 @@ fn validate_pod(pod: &Pod) -> Result<(), ApiError> {
 // ---- Node handlers (mirror the Pod/ReplicaSet handlers, over node_store) ----
 
 // Cluster pod CIDR is 10.244.0.0/16, carved into per-node /24 slices: node
-// index n -> 10.244.n.0/24. The counter persists in sled (NODE_CIDR_COUNTER),
-// so slices are stable and never reused across apiserver restarts.
+// index n -> 10.244.n.0/24. The index is DERIVED (max-assigned + 1) from the
+// existing Nodes, not a stored counter — see next_free_node_cidr_index.
 const CLUSTER_POD_CIDR_PREFIX: &str = "10.244";
-const NODE_CIDR_COUNTER: &[u8] = b"node_cidr_counter";
+
+/// Next free per-node /24 index = (max assigned) + 1, scanned over existing
+/// Nodes. PURE — same Node set → same answer on every replica, so it replaces
+/// the stateful sled counter (which couldn't survive replication / leadership
+/// moves). Gaps from deleted nodes ARE reused; fine at our scale.
+fn next_free_node_cidr_index(nodes: &[Node]) -> u64 {
+    nodes
+        .iter()
+        .filter_map(|n| n.spec.pod_cidr.as_deref())
+        .filter_map(parse_cidr_index)
+        .max()
+        .map_or(0, |m| m + 1)
+}
+
+fn parse_cidr_index(cidr: &str) -> Option<u64> {
+    cidr.strip_prefix(&format!("{CLUSTER_POD_CIDR_PREFIX}."))?
+        .split_once('.')
+        .and_then(|(idx, _rest)| idx.parse().ok())
+}
+
+/// Next free ClusterIP index = (max assigned) + 1 over existing Services.
+fn next_free_cluster_ip_index(services: &[Service]) -> u64 {
+    services
+        .iter()
+        .filter_map(|s| s.spec.cluster_ip.as_deref())
+        .filter_map(|ip| {
+            ip.strip_prefix(&format!("{SERVICE_CIDR_PREFIX}."))?
+                .parse::<u64>()
+                .ok()
+        })
+        .max()
+        .map_or(0, |m| m + 1)
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -510,7 +542,8 @@ pub async fn create_node(
     // re-POSTs the same node) doesn't burn a fresh slice — `create` below will
     // return AlreadyExists and the stored node keeps its original CIDR.
     if node.spec.pod_cidr.is_none() && state.node_store.get(&node.metadata.name)?.is_none() {
-        let idx = state.node_store.next_index(NODE_CIDR_COUNTER)?;
+        let (nodes, _) = state.node_store.list()?;
+        let idx = next_free_node_cidr_index(&nodes);
         if idx > 255 {
             return Err(ApiError::Internal(format!(
                 "pod CIDR space exhausted (node index {idx} exceeds 255)"
@@ -576,10 +609,9 @@ pub async fn replace_node_status(
     Ok((StatusCode::OK, Json(updated)).into_response())
 }
 
-// Cluster service CIDR is 10.96.0.0/16; service index n -> 10.96.0.n. Persistent
-// counter in sled, mirroring NODE_CIDR_COUNTER.
+// Cluster service CIDR is 10.96.0.0/16; service index n -> 10.96.0.n. Index is
+// DERIVED (max-assigned + 1) from existing Services — see next_free_cluster_ip_index.
 const SERVICE_CIDR_PREFIX: &str = "10.96.0";
-const SVC_CLUSTERIP_COUNTER: &[u8] = b"svc_clusterip_counter";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -644,7 +676,8 @@ pub async fn create_service(
 ) -> Result<Response, ApiError> {
     validate_service(&svc)?;
     if svc.spec.cluster_ip.is_none() && state.svc_store.get(&svc.metadata.name)?.is_none() {
-        let idx = state.svc_store.next_index(SVC_CLUSTERIP_COUNTER)?;
+        let (services, _) = state.svc_store.list()?;
+        let idx = next_free_cluster_ip_index(&services);
         if idx > 255 {
             return Err(ApiError::Internal(format!(
                 "service ClusterIP space exhausted (index {idx} exceeds 255)"
@@ -1536,6 +1569,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ---- pure scan-based allocation helpers (6b determinism) ----
+
+    fn node_with_cidr(name: &str, cidr: &str) -> Node {
+        let mut n = make_node(name);
+        n.spec.pod_cidr = Some(cidr.into());
+        n
+    }
+
+    fn svc_with_ip(name: &str, ip: &str) -> Service {
+        let mut s = make_service(name);
+        s.spec.cluster_ip = Some(ip.into());
+        s
+    }
+
+    #[test]
+    fn next_free_node_cidr_index_is_max_plus_one() {
+        // Empty → 0.
+        assert_eq!(next_free_node_cidr_index(&[]), 0);
+        // max(0, 2) + 1 = 3 — a GAP at index 1 is NOT filled (scan takes max,
+        // not first-free; simple + deterministic).
+        let nodes = vec![
+            node_with_cidr("a", "10.244.0.0/24"),
+            node_with_cidr("c", "10.244.2.0/24"),
+        ];
+        assert_eq!(next_free_node_cidr_index(&nodes), 3);
+        // Nodes without a CIDR are ignored.
+        let mixed = vec![node_with_cidr("a", "10.244.5.0/24"), make_node("pending")];
+        assert_eq!(next_free_node_cidr_index(&mixed), 6);
+    }
+
+    #[test]
+    fn next_free_node_cidr_reuses_index_after_deletion() {
+        // The documented trade-off vs a monotonic counter: with only the
+        // higher node left, the deleted lower index becomes reusable.
+        let only_high = vec![node_with_cidr("b", "10.244.1.0/24")];
+        assert_eq!(next_free_node_cidr_index(&only_high), 2);
+        // Delete b too → empty → back to 0 (a counter would never reuse 0).
+        assert_eq!(next_free_node_cidr_index(&[]), 0);
+    }
+
+    #[test]
+    fn next_free_cluster_ip_index_is_max_plus_one() {
+        assert_eq!(next_free_cluster_ip_index(&[]), 0);
+        let svcs = vec![svc_with_ip("a", "10.96.0.0"), svc_with_ip("b", "10.96.0.1")];
+        assert_eq!(next_free_cluster_ip_index(&svcs), 2);
     }
 
     // ---- Pod binding subresource ----

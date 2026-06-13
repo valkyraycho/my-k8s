@@ -5,6 +5,7 @@
 //! - [`handlers`] — axum request handlers (the REST verbs + error mapping).
 //! - [`routes`]   — wires paths/methods to handlers.
 
+pub mod applier;
 pub mod command;
 pub mod handlers;
 pub mod routes;
